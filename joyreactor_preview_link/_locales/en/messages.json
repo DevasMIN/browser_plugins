@@ -1,0 +1,9 @@
+{
+  "extName": {
+    "message": "JoyReactor MP4 for Telegram"
+  },
+  "extDescription": {
+    "message": "Copies a direct mp4/video-gif link from a JoyReactor post (handy for sending to Telegram with a preview)."
+  }
+}
+

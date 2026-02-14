@@ -484,10 +484,15 @@ function updateCurrentSpeedDisplay(speed) {
 // Обновление badge через background
 async function updateBadge(speed) {
     try {
-        await browserAPI.runtime.sendMessage({
-            action: 'updateBadge',
-            speed: speed
-        });
+        if (!browserAPI.browserAction) return;
+        
+        const speedText = speed === 1.0 ? '' : speed.toFixed(2);
+        await browserAPI.browserAction.setBadgeText({ text: speedText });
+        await browserAPI.browserAction.setBadgeBackgroundColor({ color: '#2196F3' });
+        
+        if (browserAPI.browserAction.setBadgeTextColor) {
+            await browserAPI.browserAction.setBadgeTextColor({ color: '#FFFFFF' });
+        }
     } catch (e) {
         // Игнорируем ошибки
     }
