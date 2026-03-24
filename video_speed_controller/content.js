@@ -4,6 +4,9 @@ function findVideos() {
 }
 
 let currentTargetSpeed = 1.0;
+const observedVideos = new WeakSet();
+let speedProtectionObserver = null;
+let hasInitializedDefaultSpeed = false;
 
 function getStorageKeysForCurrentPage() {
     try {
@@ -53,22 +56,41 @@ function loadSavedSpeedForCurrentPage(callback) {
                 return;
             }
 
-            if (tabKey && typeof result[tabKey] === 'number') {
-                callback(result[tabKey], 'tab');
-                return;
+            let resolvedSpeed;
+            let resolvedScope;
+
+            if (typeof result[allKey] === 'number') {
+                resolvedSpeed = result[allKey];
+                resolvedScope = 'all';
             }
 
             if (domainKey && typeof result[domainKey] === 'number') {
-                callback(result[domainKey], 'domain');
-                return;
+                resolvedSpeed = result[domainKey];
+                resolvedScope = 'domain';
             }
 
-            if (typeof result[allKey] === 'number') {
-                callback(result[allKey], 'all');
-                return;
+            if (tabKey && typeof result[tabKey] === 'number') {
+                resolvedSpeed = result[tabKey];
+                resolvedScope = 'tab';
             }
 
-            callback(undefined, undefined);
+            // Default: 100% (1.0) on first run if nothing saved yet.
+            if (typeof resolvedSpeed !== 'number') {
+                resolvedSpeed = 1.0;
+                resolvedScope = 'all';
+
+                // Write default once (do not overwrite user's existing settings).
+                if (!hasInitializedDefaultSpeed && typeof result[allKey] !== 'number') {
+                    hasInitializedDefaultSpeed = true;
+                    try {
+                        chrome.storage.local.set({ [allKey]: 1.0 }, () => {});
+                    } catch (e) {
+                        // ignore
+                    }
+                }
+            }
+
+            callback(resolvedSpeed, resolvedScope);
         });
     } catch (error) {
         // Игнорируем ошибки storage
@@ -76,16 +98,15 @@ function loadSavedSpeedForCurrentPage(callback) {
 }
 
 function setPlaybackSpeed(speed, scope) {
-    
-    const video = document.querySelector('video');
-    
-    if (!video) {
-        console.warn('⚠️ Видео не найдено');
-        return;
-    }
-
     try {
-        video.playbackRate = speed;
+        // Apply to all current videos; future videos are handled by speed protection hooks.
+        document.querySelectorAll('video').forEach((v) => {
+            try {
+                v.playbackRate = speed;
+            } catch (e) {
+                // ignore per-video failures
+            }
+        });
     } catch (e) {
         console.error('❌ Ошибка установки скорости:', e);
         return;
@@ -94,32 +115,12 @@ function setPlaybackSpeed(speed, scope) {
     currentTargetSpeed = speed;
     try {
         if (chrome && chrome.storage && chrome.storage.local) {
-            const { tabKey, domainKey, allKey } = getStorageKeysForCurrentPage();
             const storageKey = getStorageKeyForScope(scope);
 
             if (storageKey) {
-                // Сохраняем скорость для выбранной области
                 chrome.storage.local.set({ [storageKey]: speed }, () => {
                     if (chrome.runtime.lastError) {
                         return;
-                    }
-
-                    // Очищаем остальные области, чтобы не было конфликтов при загрузке
-                    const keysToRemove = [];
-
-                    if (storageKey === tabKey) {
-                        if (domainKey) keysToRemove.push(domainKey);
-                        keysToRemove.push(allKey);
-                    } else if (storageKey === domainKey) {
-                        if (tabKey) keysToRemove.push(tabKey);
-                        keysToRemove.push(allKey);
-                    } else if (storageKey === allKey) {
-                        if (tabKey) keysToRemove.push(tabKey);
-                        if (domainKey) keysToRemove.push(domainKey);
-                    }
-
-                    if (keysToRemove.length > 0) {
-                        chrome.storage.local.remove(keysToRemove);
                     }
                 });
             }
@@ -146,6 +147,48 @@ function setPlaybackSpeed(speed, scope) {
     }, 0);
 }
 
+function enforceTargetSpeed(video) {
+    if (!video || typeof currentTargetSpeed !== 'number') {
+        return;
+    }
+
+    if (Math.abs(video.playbackRate - currentTargetSpeed) > 0.001) {
+        try {
+            video.playbackRate = currentTargetSpeed;
+        } catch (e) {
+            // Игнорируем ошибки установки playbackRate
+        }
+    }
+}
+
+function bindSpeedProtection(video) {
+    if (!video || observedVideos.has(video)) {
+        return;
+    }
+
+    observedVideos.add(video);
+    video.addEventListener('ratechange', () => enforceTargetSpeed(video), true);
+    video.addEventListener('loadedmetadata', () => enforceTargetSpeed(video), true);
+    video.addEventListener('play', () => enforceTargetSpeed(video), true);
+}
+
+function setupSpeedProtection() {
+    document.querySelectorAll('video').forEach(bindSpeedProtection);
+
+    if (speedProtectionObserver) {
+        return;
+    }
+
+    speedProtectionObserver = new MutationObserver(() => {
+        document.querySelectorAll('video').forEach(bindSpeedProtection);
+    });
+
+    const root = document.documentElement || document.body;
+    if (root) {
+        speedProtectionObserver.observe(root, { childList: true, subtree: true });
+    }
+}
+
 // Получение информации о видео
 function getVideoInfo() {
     const videos = findVideos();
@@ -163,7 +206,11 @@ function getVideoInfo() {
 
 function applyStoredSpeedFromStorage() {
     loadSavedSpeedForCurrentPage((savedSpeed, savedScope) => {
+        // Always resolve to a number (defaults to 1.0).
         if (typeof savedSpeed === 'number') {
+            // Set target immediately so newly-added videos inherit speed via protection.
+            currentTargetSpeed = savedSpeed;
+            setupSpeedProtection();
             waitForVideoToApply(savedSpeed, savedScope);
         }
     });
@@ -231,6 +278,14 @@ try {
 applyStoredSpeedFromStorage();
 document.addEventListener('DOMContentLoaded', applyStoredSpeedFromStorage);
 
+// На фокусировке/возврате во вкладку перепроверяем и применяем скорость:
+// page -> domain -> global
+window.addEventListener('focus', applyStoredSpeedFromStorage, true);
+window.addEventListener('pageshow', applyStoredSpeedFromStorage, true);
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) applyStoredSpeedFromStorage();
+});
+
 function watchSpaNavigation() {
     let lastUrl = location.href;
 
@@ -259,6 +314,7 @@ function watchSpaNavigation() {
 }
 
 watchSpaNavigation();
+setupSpeedProtection();
 
 // Обработка горячих клавиш
 let shortcutHandler = null;
