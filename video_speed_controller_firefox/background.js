@@ -10,16 +10,19 @@ if (browserAPI.commands) {
 }
 
 // Обновление badge на иконке расширения (стандартный Firefox badge)
-async function updateBadge(speed) {
+async function updateBadge(speed, tabId) {
     try {
         if (!browserAPI.browserAction) return;
         
         const speedText = speed === 1.0 ? '' : speed.toFixed(1);
-        await browserAPI.browserAction.setBadgeText({ text: speedText });
-        await browserAPI.browserAction.setBadgeBackgroundColor({ color: '#2196F3' });
+        if (typeof tabId !== 'number') {
+            return;
+        }
+        await browserAPI.browserAction.setBadgeText({ text: speedText, tabId });
+        await browserAPI.browserAction.setBadgeBackgroundColor({ color: '#2196F3', tabId });
         
         if (browserAPI.browserAction.setBadgeTextColor) {
-            await browserAPI.browserAction.setBadgeTextColor({ color: '#000000' });
+            await browserAPI.browserAction.setBadgeTextColor({ color: '#000000', tabId });
         }
     } catch (e) {
         // Игнорируем ошибки badge
@@ -30,7 +33,8 @@ async function updateBadge(speed) {
 browserAPI.runtime.onMessage.addListener((request, sender, sendResponse) => {
     try {
         if (request.action === 'updateBadge') {
-            updateBadge(request.speed);
+            const senderTabId = sender && sender.tab ? sender.tab.id : undefined;
+            updateBadge(request.speed, senderTabId);
             sendResponse({ success: true });
         }
     } catch (error) {

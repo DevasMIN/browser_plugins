@@ -7,6 +7,7 @@ let currentTargetSpeed = 1.0;
 const observedVideos = new WeakSet();
 let speedProtectionObserver = null;
 let hasInitializedDefaultSpeed = false;
+let lastResolvedScope = 'all';
 
 function getStorageKeysForCurrentPage() {
     try {
@@ -97,7 +98,8 @@ function loadSavedSpeedForCurrentPage(callback) {
     }
 }
 
-function setPlaybackSpeed(speed, scope) {
+function setPlaybackSpeed(speed, scope, options = {}) {
+    const { persist = true } = options;
     try {
         // Apply to all current videos; future videos are handled by speed protection hooks.
         document.querySelectorAll('video').forEach((v) => {
@@ -113,20 +115,22 @@ function setPlaybackSpeed(speed, scope) {
     }
     
     currentTargetSpeed = speed;
-    try {
-        if (chrome && chrome.storage && chrome.storage.local) {
-            const storageKey = getStorageKeyForScope(scope);
+    if (persist) {
+        try {
+            if (chrome && chrome.storage && chrome.storage.local) {
+                const storageKey = getStorageKeyForScope(scope);
 
-            if (storageKey) {
-                chrome.storage.local.set({ [storageKey]: speed }, () => {
-                    if (chrome.runtime.lastError) {
-                        return;
-                    }
-                });
+                if (storageKey) {
+                    chrome.storage.local.set({ [storageKey]: speed }, () => {
+                        if (chrome.runtime.lastError) {
+                            return;
+                        }
+                    });
+                }
             }
+        } catch (storeError) {
+            // Игнорируем ошибки storage
         }
-    } catch (storeError) {
-        // Игнорируем ошибки storage
     }
     
     // Отправляем сообщение в background для обновления badge
@@ -193,11 +197,12 @@ function setupSpeedProtection() {
 function getVideoInfo() {
     const videos = findVideos();
     if (videos.length === 0) {
-        return { playing: false, currentTime: 0, currentSpeed: 1.0 };
+        return { hasVideo: false, playing: false, currentTime: 0, currentSpeed: 1.0 };
     }
     
     const video = videos[0]; // Берем первое видео
     return {
+        hasVideo: true,
         playing: !video.paused,
         currentTime: video.currentTime,
         currentSpeed: video.playbackRate || 1.0
@@ -208,6 +213,7 @@ function applyStoredSpeedFromStorage() {
     loadSavedSpeedForCurrentPage((savedSpeed, savedScope) => {
         // Always resolve to a number (defaults to 1.0).
         if (typeof savedSpeed === 'number') {
+            lastResolvedScope = savedScope || 'all';
             // Set target immediately so newly-added videos inherit speed via protection.
             currentTargetSpeed = savedSpeed;
             setupSpeedProtection();
@@ -219,7 +225,7 @@ function applyStoredSpeedFromStorage() {
 function waitForVideoToApply(speed, scope, attempts = 0) {
     const video = document.querySelector('video');
     if (video) {
-        setPlaybackSpeed(speed, scope || 'tab');
+        setPlaybackSpeed(speed, scope || 'all', { persist: false });
         return;
     }
 
@@ -253,6 +259,16 @@ try {
                 const videos = findVideos();
                 const currentSpeed = videos.length > 0 ? videos[0].playbackRate : 1.0;
                 sendResponse({ currentSpeed: currentSpeed });
+            } else if (request.action === 'getEffectiveSpeed') {
+                loadSavedSpeedForCurrentPage((savedSpeed, savedScope) => {
+                    const videos = findVideos();
+                    const currentSpeed = videos.length > 0 ? videos[0].playbackRate : savedSpeed;
+                    sendResponse({
+                        currentSpeed: typeof currentSpeed === 'number' ? currentSpeed : 1.0,
+                        effectiveScope: savedScope || lastResolvedScope || 'all'
+                    });
+                });
+                return true;
             } else if (request.action === 'applySavedSpeed') {
                 applyStoredSpeedFromStorage();
                 sendResponse({ success: true });

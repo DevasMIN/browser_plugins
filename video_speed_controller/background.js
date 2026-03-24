@@ -5,12 +5,15 @@ chrome.runtime.onInstalled.addListener(() => {});
 chrome.commands.onCommand.addListener(() => {});
 
 // Обновление badge на иконке расширения
-async function updateBadge(speed) {
+async function updateBadge(speed, tabId) {
     try {
         if (chrome && chrome.action && chrome.action.setBadgeText) {
             const speedText = speed === 1.0 ? '' : speed.toFixed(2);
-            await chrome.action.setBadgeText({ text: speedText });
-            await chrome.action.setBadgeBackgroundColor({ color: '#2196F3' });
+            if (typeof tabId !== 'number') {
+                return;
+            }
+            await chrome.action.setBadgeText({ text: speedText, tabId });
+            await chrome.action.setBadgeBackgroundColor({ color: '#2196F3', tabId });
         }
     } catch (e) {
         // Игнорируем ошибки badge
@@ -21,7 +24,8 @@ async function updateBadge(speed) {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     try {
         if (request.action === 'updateBadge') {
-            updateBadge(request.speed);
+            const senderTabId = sender && sender.tab ? sender.tab.id : undefined;
+            updateBadge(request.speed, senderTabId);
             sendResponse({ success: true });
         }
     } catch (error) {

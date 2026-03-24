@@ -11,6 +11,16 @@ let currentEditingIndex = null;
 let isEnabled = true;
 let currentScope = 'tab';
 let currentMessages = null; // null = use chrome.i18n
+let activeTabId = null;
+
+function applyScopeToUi(scope) {
+    const normalizedScope = ['tab', 'domain', 'all'].includes(scope) ? scope : 'all';
+    currentScope = normalizedScope;
+    const scopeInput = document.querySelector(`input[name="scope"][value="${normalizedScope}"]`);
+    if (scopeInput) {
+        scopeInput.checked = true;
+    }
+}
 
 // Загрузить переводы из _locales/{locale}/messages.json
 async function loadLocale(locale) {
@@ -99,51 +109,31 @@ async function init() {
         try {
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
             if (tab && tab.id && isScriptableUrl(tab.url)) {
+                activeTabId = tab.id;
                 try {
-                    const results = await chrome.scripting.executeScript({
-                        target: { tabId: tab.id },
-                        func: () => {
-                            const videos = document.querySelectorAll('video');
-                            return videos.length > 0 ? videos[0].playbackRate : 1.0;
+                    chrome.tabs.sendMessage(tab.id, { action: 'getEffectiveSpeed' }, (response) => {
+                        // Проверяем lastError только если он есть
+                        if (chrome.runtime.lastError) {
+                            const errorMsg = chrome.runtime.lastError.message || '';
+                            // Игнорируем ожидаемые ошибки
+                            if (errorMsg.includes('Receiving end does not exist') ||
+                                errorMsg.includes('Extension context invalidated')) {
+                                return;
+                            }
+                            return;
+                        }
+                        if (response && typeof response.currentSpeed === 'number') {
+                            const speedPercent = Math.round(response.currentSpeed * 100);
+                            document.getElementById('currentSpeed').value = speedPercent;
+                            updateCurrentSpeedDisplay(response.currentSpeed);
+                            updateBadge(response.currentSpeed);
+                        }
+                        if (response && response.effectiveScope) {
+                            applyScopeToUi(response.effectiveScope);
                         }
                     });
-                    
-                    if (results && results[0] && results[0].result) {
-                        const currentSpeed = results[0].result;
-                        const speedPercent = Math.round(currentSpeed * 100);
-                        document.getElementById('currentSpeed').value = speedPercent;
-                        updateCurrentSpeedDisplay(currentSpeed);
-                    }
-                } catch (err) {
-                    // Игнорируем ожидаемые ошибки
-                    const errMsg = err.message || err.toString() || '';
-                    if (errMsg.includes('chrome://') ||
-                        errMsg.includes('Cannot access') ||
-                        errMsg.includes('Extension context invalidated')) {
-                        return;
-                    }
-                    // Fallback
-                    try {
-                        chrome.tabs.sendMessage(tab.id, { action: 'getCurrentSpeed' }, (response) => {
-                            // Проверяем lastError только если он есть
-                            if (chrome.runtime.lastError) {
-                                const errorMsg = chrome.runtime.lastError.message || '';
-                                // Игнорируем ожидаемые ошибки
-                                if (errorMsg.includes('Receiving end does not exist') ||
-                                    errorMsg.includes('Extension context invalidated')) {
-                                    return;
-                                }
-                            }
-                            if (response && response.currentSpeed) {
-                                const speedPercent = Math.round(response.currentSpeed * 100);
-                                document.getElementById('currentSpeed').value = speedPercent;
-                                updateCurrentSpeedDisplay(response.currentSpeed);
-                                updateBadge(response.currentSpeed);
-                            }
-                        });
-                    } catch (msgErr) {
-                        // Игнорируем ошибки
-                    }
+                } catch (msgErr) {
+                    // Игнорируем ошибки
                 }
             }
         } catch (e) {
@@ -168,7 +158,7 @@ async function loadSettings() {
     currentScope = result.scope || 'tab';
     
     document.getElementById('toggleEnabled').checked = isEnabled;
-    document.querySelector(`input[name="scope"][value="${currentScope}"]`).checked = true;
+    applyScopeToUi(currentScope);
 }
 
 // Создание дефолтных пресетов
@@ -433,6 +423,8 @@ async function updateVideoInfo() {
     try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (!tab || !tab.id) return;
+        const requestTabId = tab.id;
+        activeTabId = requestTabId;
         
         // Проверяем доступность URL
         if (!isScriptableUrl(tab.url)) {
@@ -452,14 +444,15 @@ async function updateVideoInfo() {
         // Используем executeScript для надежного получения информации
         try {
             const results = await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
+                target: { tabId: requestTabId },
                 func: () => {
                     const videos = document.querySelectorAll('video');
                     if (videos.length === 0) {
-                        return { playing: false, currentTime: 0, currentSpeed: 1.0 };
+                        return { hasVideo: false, playing: false, currentTime: 0, currentSpeed: 1.0 };
                     }
                     const video = videos[0];
                     return {
+                        hasVideo: true,
                         playing: !video.paused,
                         currentTime: video.currentTime || 0,
                         currentSpeed: video.playbackRate || 1.0
@@ -468,12 +461,16 @@ async function updateVideoInfo() {
             });
             
             if (results && results[0] && results[0].result) {
+                if (requestTabId !== activeTabId) return;
                 const info = results[0].result;
                 document.getElementById('playStatus').textContent =
                     info.playing ? getMessage('playStatusPlaying') : getMessage('playStatus');
                 document.getElementById('currentTime').textContent = formatTime(info.currentTime);
-                updateCurrentSpeedDisplay(info.currentSpeed);
-                updateBadge(info.currentSpeed);
+                if (info.hasVideo && typeof info.currentSpeed === 'number') {
+                    updateCurrentSpeedDisplay(info.currentSpeed);
+                    updateBadge(info.currentSpeed);
+                    document.getElementById('currentSpeed').value = Math.round(info.currentSpeed * 100);
+                }
             }
         } catch (err) {
             // Игнорируем ожидаемые ошибки
@@ -485,7 +482,8 @@ async function updateVideoInfo() {
             }
             // Fallback через sendMessage
             try {
-                chrome.tabs.sendMessage(tab.id, { action: 'getVideoInfo' }, (response) => {
+                chrome.tabs.sendMessage(requestTabId, { action: 'getVideoInfo' }, (response) => {
+                    if (requestTabId !== activeTabId) return;
                     // Проверяем lastError только если он есть
                     if (chrome.runtime.lastError) {
                         const errorMsg = chrome.runtime.lastError.message || '';
@@ -499,9 +497,10 @@ async function updateVideoInfo() {
                         document.getElementById('playStatus').textContent =
                             response.playing ? getMessage('playStatusPlaying') : getMessage('playStatus');
                         document.getElementById('currentTime').textContent = formatTime(response.currentTime);
-                        if (response.currentSpeed) {
+                        if (response.hasVideo && typeof response.currentSpeed === 'number') {
                             updateCurrentSpeedDisplay(response.currentSpeed);
                             updateBadge(response.currentSpeed);
+                            document.getElementById('currentSpeed').value = Math.round(response.currentSpeed * 100);
                         }
                     }
                 });
@@ -541,12 +540,15 @@ function updateCurrentSpeedDisplay(speed) {
 }
 
 // Обновление badge на иконке расширения
-async function updateBadge(speed) {
+async function updateBadge(speed, tabId = activeTabId) {
     try {
         if (chrome && chrome.action && chrome.action.setBadgeText) {
             const speedText = speed === 1.0 ? '' : speed.toFixed(2);
-            await chrome.action.setBadgeText({ text: speedText });
-            await chrome.action.setBadgeBackgroundColor({ color: '#2196F3' });
+            if (typeof tabId !== 'number') {
+                return;
+            }
+            await chrome.action.setBadgeText({ text: speedText, tabId });
+            await chrome.action.setBadgeBackgroundColor({ color: '#2196F3', tabId });
         }
     } catch (e) {
         // Игнорируем ошибки badge
@@ -629,6 +631,9 @@ function adjustSpeed(delta) {
 // Обработка сообщений от content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'speedChanged') {
+        if (!sender || !sender.tab || !activeTabId || sender.tab.id !== activeTabId) {
+            return;
+        }
         const speedPercent = Math.round(request.speed * 100);
         document.getElementById('currentSpeed').value = speedPercent;
         updateCurrentSpeedDisplay(request.speed);

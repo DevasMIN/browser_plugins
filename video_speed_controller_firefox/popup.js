@@ -14,6 +14,16 @@ let currentEditingIndex = null;
 let isEnabled = true;
 let currentScope = 'tab';
 let currentMessages = null; // null = use chrome.i18n
+let activeTabId = null;
+
+function applyScopeToUi(scope) {
+    const normalizedScope = ['tab', 'domain', 'all'].includes(scope) ? scope : 'all';
+    currentScope = normalizedScope;
+    const scopeInput = document.querySelector(`input[name="scope"][value="${normalizedScope}"]`);
+    if (scopeInput) {
+        scopeInput.checked = true;
+    }
+}
 
 // Загрузить переводы из _locales/{locale}/messages.json
 async function loadLocale(locale) {
@@ -102,14 +112,18 @@ async function init() {
         try {
             const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
             if (tab && tab.id && isScriptableUrl(tab.url)) {
+                activeTabId = tab.id;
                 try {
-                    // Используем sendMessage вместо executeScript для Firefox
-                    const response = await browserAPI.tabs.sendMessage(tab.id, { action: 'getCurrentSpeed' });
-                    if (response && response.currentSpeed) {
+                    // Получаем и текущую скорость, и источник (tab/domain/all)
+                    const response = await browserAPI.tabs.sendMessage(tab.id, { action: 'getEffectiveSpeed' });
+                    if (response && typeof response.currentSpeed === 'number') {
                         const speedPercent = Math.round(response.currentSpeed * 100);
                         document.getElementById('currentSpeed').value = speedPercent;
                         updateCurrentSpeedDisplay(response.currentSpeed);
                         updateBadge(response.currentSpeed);
+                    }
+                    if (response && response.effectiveScope) {
+                        applyScopeToUi(response.effectiveScope);
                     }
                 } catch (err) {
                     // Игнорируем ожидаемые ошибки
@@ -145,7 +159,7 @@ async function loadSettings() {
     currentScope = result.scope || 'tab';
     
     document.getElementById('toggleEnabled').checked = isEnabled;
-    document.querySelector(`input[name="scope"][value="${currentScope}"]`).checked = true;
+    applyScopeToUi(currentScope);
 }
 
 // Создание дефолтных пресетов
@@ -410,6 +424,8 @@ async function updateVideoInfo() {
     try {
         const [tab] = await browserAPI.tabs.query({ active: true, currentWindow: true });
         if (!tab || !tab.id) return;
+        const requestTabId = tab.id;
+        activeTabId = requestTabId;
         
         // Проверяем доступность URL
         if (!isScriptableUrl(tab.url)) {
@@ -428,14 +444,16 @@ async function updateVideoInfo() {
         
         // Используем sendMessage для получения информации
         try {
-            const response = await browserAPI.tabs.sendMessage(tab.id, { action: 'getVideoInfo' });
+            const response = await browserAPI.tabs.sendMessage(requestTabId, { action: 'getVideoInfo' });
+            if (requestTabId !== activeTabId) return;
             if (response) {
                 document.getElementById('playStatus').textContent =
                     response.playing ? getMessage('playStatusPlaying') : getMessage('playStatus');
                 document.getElementById('currentTime').textContent = formatTime(response.currentTime);
-                if (response.currentSpeed) {
+                if (response.hasVideo && typeof response.currentSpeed === 'number') {
                     updateCurrentSpeedDisplay(response.currentSpeed);
                     updateBadge(response.currentSpeed);
+                    document.getElementById('currentSpeed').value = Math.round(response.currentSpeed * 100);
                 }
             }
         } catch (err) {
@@ -482,16 +500,17 @@ function updateCurrentSpeedDisplay(speed) {
 }
 
 // Обновление badge через background
-async function updateBadge(speed) {
+async function updateBadge(speed, tabId = activeTabId) {
     try {
         if (!browserAPI.browserAction) return;
+        if (typeof tabId !== 'number') return;
         
         const speedText = speed === 1.0 ? '' : speed.toFixed(2);
-        await browserAPI.browserAction.setBadgeText({ text: speedText });
-        await browserAPI.browserAction.setBadgeBackgroundColor({ color: '#2196F3' });
+        await browserAPI.browserAction.setBadgeText({ text: speedText, tabId });
+        await browserAPI.browserAction.setBadgeBackgroundColor({ color: '#2196F3', tabId });
         
         if (browserAPI.browserAction.setBadgeTextColor) {
-            await browserAPI.browserAction.setBadgeTextColor({ color: '#FFFFFF' });
+            await browserAPI.browserAction.setBadgeTextColor({ color: '#FFFFFF', tabId });
         }
     } catch (e) {
         // Игнорируем ошибки
@@ -574,6 +593,9 @@ function adjustSpeed(delta) {
 // Обработка сообщений от content script
 browserAPI.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'speedChanged') {
+        if (!sender || !sender.tab || !activeTabId || sender.tab.id !== activeTabId) {
+            return;
+        }
         const speedPercent = Math.round(request.speed * 100);
         document.getElementById('currentSpeed').value = speedPercent;
         updateCurrentSpeedDisplay(request.speed);
