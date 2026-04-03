@@ -13,30 +13,29 @@ function getStorageKeysForCurrentPage() {
     try {
         const url = new URL(window.location.href);
         return {
-            tabKey: `speed_tab_${url.href}`,
             domainKey: `speed_domain_${url.hostname}`,
             allKey: 'speed_all'
         };
     } catch (error) {
         return {
-            tabKey: null,
             domainKey: null,
             allKey: 'speed_all'
         };
     }
 }
 
+// Persist only global (speed_all) and per-hostname (speed_domain_*). Scope "tab" is not stored.
 function getStorageKeyForScope(scope) {
-    const { tabKey, domainKey } = getStorageKeysForCurrentPage();
+    const { domainKey } = getStorageKeysForCurrentPage();
     switch (scope) {
         case 'tab':
-            return tabKey || 'speed_all';
+            return null;
         case 'domain':
             return domainKey || 'speed_all';
         case 'all':
             return 'speed_all';
         default:
-            return tabKey || domainKey || 'speed_all';
+            return domainKey || 'speed_all';
     }
 }
 
@@ -46,9 +45,8 @@ function loadSavedSpeedForCurrentPage(callback) {
             return;
         }
 
-        const { tabKey, domainKey, allKey } = getStorageKeysForCurrentPage();
+        const { domainKey, allKey } = getStorageKeysForCurrentPage();
         const keys = [];
-        if (tabKey) keys.push(tabKey);
         if (domainKey) keys.push(domainKey);
         keys.push(allKey);
 
@@ -68,11 +66,6 @@ function loadSavedSpeedForCurrentPage(callback) {
             if (domainKey && typeof result[domainKey] === 'number') {
                 resolvedSpeed = result[domainKey];
                 resolvedScope = 'domain';
-            }
-
-            if (tabKey && typeof result[tabKey] === 'number') {
-                resolvedSpeed = result[tabKey];
-                resolvedScope = 'tab';
             }
 
             // Default: 100% (1.0) on first run if nothing saved yet.

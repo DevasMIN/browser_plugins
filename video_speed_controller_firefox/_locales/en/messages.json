@@ -1,6 +1,6 @@
 {
   "extName": {
-    "message": "SpeedTube - Video Speed Controller",
+    "message": "SpeedPlayBack - Video Speed Controller",
     "description": "Extension name"
   },
   "extDescription": {
@@ -8,7 +8,7 @@
     "description": "Extension description"
   },
   "logoTitle": {
-    "message": "SPEEDTUBE",
+    "message": "SPEEDPLAYBACK",
     "description": "Logo title"
   },
   "logoSubtitle": {

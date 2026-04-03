@@ -1,4 +1,4 @@
-# SpeedTube - Video Speed Controller ⚡
+# SpeedPlayBack - Video Speed Controller ⚡
 
 Firefox расширение для управления скоростью воспроизведения видео с настраиваемыми пресетами и горячими клавишами.
 

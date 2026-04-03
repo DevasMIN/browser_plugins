@@ -1,4 +1,4 @@
-# SpeedTube - Video Speed Controller ⚡
+# SpeedPlayBack - Video Speed Controller ⚡
 
 Chrome extension for controlling video playback speed with customizable presets and keyboard shortcuts.
 
