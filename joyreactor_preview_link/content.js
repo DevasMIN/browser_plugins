@@ -25,6 +25,7 @@ function ensureStyles() {
     }
     .${BTN_CLASS}[data-variant="inline"] {
       padding: 0;
+      margin: 0 6px;
       border-radius: 0;
       background: transparent;
       box-shadow: none;
@@ -236,62 +237,76 @@ function injectFloatingButtonOnPostPage() {
   document.documentElement.appendChild(btn);
 }
 
-function enhanceFeedMedia() {
-  // Try to place a small MP4 button on media blocks in the feed.
-  // We don't rely on exact JoyReactor markup: detect images/videos and find nearest /post/<id> link.
-  const mediaNodes = Array.from(document.querySelectorAll("img, video"));
-  for (const media of mediaNodes) {
-    if (!(media instanceof HTMLElement)) continue;
-    if (media.dataset.jrMp4Enhanced === "1") continue;
-
-    const container = media.closest("a") || media.closest("div") || media.parentElement;
-    if (!container) continue;
-
-    // Find post id nearby
-    let postId = null;
-    const nearLink =
-      container.closest("a[href*='/post/']") ||
-      container.querySelector?.("a[href*='/post/']") ||
-      media.closest("div")?.querySelector?.("a[href*='/post/']");
-
-    if (nearLink && nearLink.getAttribute) {
-      postId = extractPostIdFromUrl(nearLink.getAttribute("href") || "");
-    }
-    if (!postId) continue;
-
-    // Create mini overlay button near media
-    const wrapper = media.parentElement;
-    if (!wrapper) continue;
-
-    // Ensure wrapper can host absolutely-positioned overlay
-    const computed = window.getComputedStyle(wrapper);
-    if (computed.position === "static") wrapper.style.position = "relative";
-
-    if (wrapper.querySelector(`.${BTN_CLASS}[data-post-id='${postId}']`)) {
-      media.dataset.jrMp4Enhanced = "1";
-      continue;
-    }
-
-    const btn = createButton({ postId, variant: "mini" });
-    btn.dataset.postId = postId;
-    btn.style.position = "absolute";
-    btn.style.left = "8px";
-    btn.style.top = "8px";
-    btn.style.zIndex = "10";
-
-    wrapper.appendChild(btn);
-    media.dataset.jrMp4Enhanced = "1";
+function isPostLinkAnchor(a) {
+  try {
+    if (!(a instanceof HTMLAnchorElement)) return false;
+    const u = new URL(a.getAttribute("href") || "", location.href);
+    // Post-level link looks like /post/6264278 (no hash like #comment...).
+    if (!/^\/post\/\d+$/i.test(u.pathname)) return false;
+    if (u.hash) return false;
+    if (u.search) return false;
+    return true;
+  } catch {
+    return false;
   }
 }
 
+function injectButtonsInFeed() {
+  // In feed pages, prefer inserting an inline "mp4" link next to each post-level "ссылка".
+  // This avoids overlay artifacts on comments/avatars.
+  const anchors = Array.from(document.querySelectorAll("a")).filter((a) => {
+    const t = (a.textContent || "").trim().toLowerCase();
+    if (t !== "ссылка") return false;
+    return isPostLinkAnchor(a);
+  });
+
+  for (const a of anchors) {
+    if (a.dataset.jrMp4Done === "1") continue;
+    const postId = extractPostIdFromUrl(a.href);
+    if (!postId) continue;
+
+    // Avoid double insert if already present right after the link.
+    const next = a.nextSibling;
+    if (
+      next &&
+      next.nodeType === Node.ELEMENT_NODE &&
+      /** @type {Element} */ (next).classList?.contains(BTN_CLASS)
+    ) {
+      a.dataset.jrMp4Done = "1";
+      continue;
+    }
+
+    const btn = createButton({ postId, variant: "inline" });
+    btn.dataset.postId = postId;
+    btn.dataset.inline = "1";
+
+    // Insert after "ссылка"
+    a.insertAdjacentText("afterend", " ");
+    a.insertAdjacentElement("afterend", btn);
+    a.insertAdjacentText("afterend", " ");
+
+    a.dataset.jrMp4Done = "1";
+  }
+}
+
+function isPostPage() {
+  return /^\/post\/\d+$/i.test(location.pathname);
+}
+
 function init() {
-  injectFloatingButtonOnPostPage();
-  enhanceFeedMedia();
+  if (isPostPage()) {
+    injectFloatingButtonOnPostPage();
+  } else {
+    injectButtonsInFeed();
+  }
 
   // Re-scan on dynamic updates
   const mo = new MutationObserver(() => {
-    injectFloatingButtonOnPostPage();
-    enhanceFeedMedia();
+    if (isPostPage()) {
+      injectFloatingButtonOnPostPage();
+    } else {
+      injectButtonsInFeed();
+    }
   });
   mo.observe(document.documentElement, { childList: true, subtree: true });
 }
