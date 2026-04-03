@@ -6,7 +6,7 @@ Collection of useful Chrome extensions with multi-language support.
 
 ## 🔌 Plugins
 
-### 1. SpeedTube ⚡
+### 1. SpeedPlayBack ⚡
 **Folder:** `video_speed_controller/`
 
 Control video playback speed with customizable presets and keyboard shortcuts.
@@ -58,7 +58,7 @@ Language is selected automatically based on browser language.
 
 ```
 browser_plugins/
-├── video_speed_controller/    # SpeedTube
+├── video_speed_controller/    # SpeedPlayBack
 │   ├── _locales/              # Translations (ru, en, es)
 │   ├── icons/                 # Icons
 │   ├── manifest.json          # Configuration
