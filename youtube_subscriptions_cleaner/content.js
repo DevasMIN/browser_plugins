@@ -11,6 +11,8 @@ const TARGET_URL_PARTS = [
   '/@WorkshopCinemaHD',
   '/channel/UCbd7vzvz5wFe7r_KaW5tQUw', // FRESH Trailers
   '/channel/UCEScTo5Hk1YXsCqGW1zgQEw', // топКино
+  '/@KinoCheck.com',
+  '/channel/UCOL10n-as9dXO2qtjjFUQbQ', // KinoCheck.com
 ];
 
 // Маркеры в тексте карточки
@@ -20,6 +22,7 @@ const TARGET_TEXT_MARKERS = [
   'fresh trailers',
   'freshtrailers',
   'топкино',
+  'kinocheck.com',
 ];
 
 // Маркеры во внутренних данных web‑компонентов
@@ -31,6 +34,10 @@ const TARGET_META_MARKERS = [
   'UCEScTo5Hk1YXsCqGW1zgQEw',
   'FRESH Trailers',
   'топКино',
+  '@KinoCheck.com',
+  'KinoCheck.com',
+  'KinoCheck',
+  'UCOL10n-as9dXO2qtjjFUQbQ',
 ];
 const HIDDEN_CLASS = 'yt-hide-workshopcinemahd';
 const CARD_SELECTOR =
@@ -87,12 +94,49 @@ function getCardElementFromLink(link) {
   return outerCard;
 }
 
+// Ограниченный обход вместо JSON.stringify: полный stringify по __data ломал
+// главный поток при частых мутациях и лента переставала подгружаться.
+const META_WALK_MAX_DEPTH = 5;
+const META_WALK_MAX_KEYS = 48;
+const META_WALK_MAX_ARRAY = 40;
+
+function objectContainsAnyMarker(value, markers, depth) {
+  if (depth <= 0) return false;
+  if (value == null) return false;
+  const t = typeof value;
+  if (t === 'string') {
+    for (let i = 0; i < markers.length; i++) {
+      if (value.includes(markers[i])) return true;
+    }
+    return false;
+  }
+  if (t !== 'object') return false;
+  if (Array.isArray(value)) {
+    const n = Math.min(value.length, META_WALK_MAX_ARRAY);
+    for (let i = 0; i < n; i++) {
+      if (objectContainsAnyMarker(value[i], markers, depth - 1)) return true;
+    }
+    return false;
+  }
+  try {
+    const keys = Object.keys(value);
+    const n = Math.min(keys.length, META_WALK_MAX_KEYS);
+    for (let i = 0; i < n; i++) {
+      if (objectContainsAnyMarker(value[keys[i]], markers, depth - 1)) return true;
+    }
+  } catch (e) {
+    return false;
+  }
+  return false;
+}
+
 function hideCardsForChannel(root) {
   if (!root || !root.querySelectorAll) return;
 
   // 1) По href: любые ссылки, ведущие на целевые каналы
   TARGET_URL_PARTS.forEach((part) => {
-    const links = root.querySelectorAll(`a[href*="${part}"]`);
+    const sel = `a[href*="${part}"]`;
+    const links = root.querySelectorAll(sel);
     links.forEach((link) => {
       const card = getCardElementFromLink(link);
       if (!card) return;
@@ -102,11 +146,22 @@ function hideCardsForChannel(root) {
         log('hide card by link', part, card);
       }
     });
+    // Вставленный узел может быть самой <a> — querySelectorAll не включает root.
+    if (root.matches && root.matches(sel)) {
+      const card = getCardElementFromLink(root);
+      if (card && !card.classList.contains(HIDDEN_CLASS)) {
+        card.classList.add(HIDDEN_CLASS);
+        log('hide card by link (root anchor)', part, card);
+      }
+    }
   });
 
   // Дополнительно ловим коллаборации, где handle может не быть в href,
   // но есть в тексте карточки или во внутренних данных компонента.
-  const cards = root.querySelectorAll(CARD_SELECTOR);
+  const cards = new Set(root.querySelectorAll(CARD_SELECTOR));
+  if (root.matches && root.matches(CARD_SELECTOR)) {
+    cards.add(root);
+  }
   cards.forEach((card) => {
     if (!(card instanceof HTMLElement) || card.classList.contains(HIDDEN_CLASS)) return;
 
@@ -134,17 +189,13 @@ function hideCardsForChannel(root) {
         ];
         for (const d of possibleData) {
           if (!d) continue;
-          const s = JSON.stringify(d);
-          for (const marker of TARGET_META_MARKERS) {
-            if (s.includes(marker)) {
-              shouldHide = true;
-              break;
-            }
+          if (objectContainsAnyMarker(d, TARGET_META_MARKERS, META_WALK_MAX_DEPTH)) {
+            shouldHide = true;
+            break;
           }
-          if (shouldHide) break;
         }
       } catch (e) {
-        // игнорируем любые ошибки сериализации
+        // игнорируем ошибки обхода
       }
     }
 
@@ -158,15 +209,20 @@ function hideCardsForChannel(root) {
   });
 }
 
+// Сразу обрабатываем только вставленное поддерево (в том же микротаске, до отрисовки).
+// Debounce по таймеру давал до ~120ms «мигания» карточек.
 const observer = new MutationObserver((mutations) => {
   if (!isOnSubscriptionsPage()) return;
 
-  mutations.forEach((mutation) => {
-    mutation.addedNodes.forEach((node) => {
-      if (!(node instanceof HTMLElement)) return;
-      hideCardsForChannel(node);
-    });
-  });
+  for (let i = 0; i < mutations.length; i++) {
+    const added = mutations[i].addedNodes;
+    for (let j = 0; j < added.length; j++) {
+      const node = added[j];
+      if (node instanceof HTMLElement) {
+        hideCardsForChannel(node);
+      }
+    }
+  }
 });
 
 function startObserver() {
@@ -342,12 +398,6 @@ function initChannelAutoSubscribe() {
     if (shouldClick) {
       button.click();
     }
-
-    setTimeout(() => {
-      try {
-        window.close();
-      } catch (e) {}
-    }, 2000);
   }
 
   tryClick();
