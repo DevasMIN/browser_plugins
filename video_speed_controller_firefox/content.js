@@ -12,24 +12,47 @@ let speedProtectionObserver = null;
 let hasInitializedDefaultSpeed = false;
 let lastResolvedScope = 'all';
 
+/** Single object in local storage; avoids unbounded `speed_tab_*` keys. */
+const SPEED_TAB_STORE_KEY = 'speed_tab_store_v1';
+const MAX_TAB_SPEED_ENTRIES = 250;
+
+function pruneTabSpeedStore(store) {
+    const entries = store && typeof store.entries === 'object' ? { ...store.entries } : {};
+    const ts = store && typeof store.ts === 'object' ? { ...store.ts } : {};
+    const urls = Object.keys(entries);
+    if (urls.length <= MAX_TAB_SPEED_ENTRIES) {
+        return { entries, ts };
+    }
+    const ordered = urls.slice().sort((a, b) => (ts[a] || 0) - (ts[b] || 0));
+    while (ordered.length > MAX_TAB_SPEED_ENTRIES) {
+        const del = ordered.shift();
+        delete entries[del];
+        delete ts[del];
+    }
+    return { entries, ts };
+}
+
 function getStorageKeysForCurrentPage() {
     try {
         const url = new URL(window.location.href);
         return {
+            pageUrl: url.href,
+            tabKey: `speed_tab_${url.href}`,
             domainKey: `speed_domain_${url.hostname}`,
             allKey: 'speed_all'
         };
     } catch (error) {
         return {
+            pageUrl: null,
+            tabKey: null,
             domainKey: null,
             allKey: 'speed_all'
         };
     }
 }
 
-// Persist only global (speed_all) and per-hostname (speed_domain_*). Scope "tab" is not stored.
 function getStorageKeyForScope(scope) {
-    const { domainKey } = getStorageKeysForCurrentPage();
+    const { tabKey, domainKey } = getStorageKeysForCurrentPage();
     switch (scope) {
         case 'tab':
             return null;
@@ -42,16 +65,28 @@ function getStorageKeyForScope(scope) {
     }
 }
 
+async function writeTabSpeedToStore(pageUrl, speed) {
+    if (!browserAPI?.storage?.local || !pageUrl) {
+        return;
+    }
+    const raw = await browserAPI.storage.local.get(SPEED_TAB_STORE_KEY);
+    let store = raw[SPEED_TAB_STORE_KEY] || { entries: {}, ts: {} };
+    store.entries = { ...store.entries, [pageUrl]: speed };
+    store.ts = { ...store.ts, [pageUrl]: Date.now() };
+    store = pruneTabSpeedStore(store);
+    await browserAPI.storage.local.set({ [SPEED_TAB_STORE_KEY]: store });
+}
+
 async function loadSavedSpeedForCurrentPage(callback) {
     try {
         if (!browserAPI || !browserAPI.storage || !browserAPI.storage.local) {
             return;
         }
 
-        const { domainKey, allKey } = getStorageKeysForCurrentPage();
-        const keys = [];
+        const { pageUrl, tabKey, domainKey, allKey } = getStorageKeysForCurrentPage();
+        const keys = [allKey, SPEED_TAB_STORE_KEY];
+        if (tabKey) keys.push(tabKey);
         if (domainKey) keys.push(domainKey);
-        keys.push(allKey);
 
         const result = await browserAPI.storage.local.get(keys);
 
@@ -66,6 +101,36 @@ async function loadSavedSpeedForCurrentPage(callback) {
         if (domainKey && typeof result[domainKey] === 'number') {
             resolvedSpeed = result[domainKey];
             resolvedScope = 'domain';
+        }
+
+        const bundle = result[SPEED_TAB_STORE_KEY];
+        let tabFromBundle =
+            pageUrl && bundle && typeof bundle.entries === 'object' && typeof bundle.entries[pageUrl] === 'number'
+                ? bundle.entries[pageUrl]
+                : undefined;
+        const tabFromLegacy = tabKey && typeof result[tabKey] === 'number' ? result[tabKey] : undefined;
+
+        if (tabFromBundle !== undefined) {
+            resolvedSpeed = tabFromBundle;
+            resolvedScope = 'tab';
+            if (tabFromLegacy !== undefined) {
+                try {
+                    await browserAPI.storage.local.remove(tabKey);
+                } catch (e) {
+                    // ignore
+                }
+            }
+        } else if (tabFromLegacy !== undefined) {
+            resolvedSpeed = tabFromLegacy;
+            resolvedScope = 'tab';
+            if (pageUrl) {
+                try {
+                    await writeTabSpeedToStore(pageUrl, tabFromLegacy);
+                    await browserAPI.storage.local.remove(tabKey);
+                } catch (e) {
+                    // ignore
+                }
+            }
         }
 
         // Default: 100% (1.0) on first run if nothing saved yet.
@@ -109,10 +174,14 @@ async function setPlaybackSpeed(speed, scope, options = {}) {
     if (persist) {
         try {
             if (browserAPI && browserAPI.storage && browserAPI.storage.local) {
-                const storageKey = getStorageKeyForScope(scope);
-
-                if (storageKey) {
-                    await browserAPI.storage.local.set({ [storageKey]: speed });
+                if (scope === 'tab') {
+                    const { pageUrl } = getStorageKeysForCurrentPage();
+                    await writeTabSpeedToStore(pageUrl, speed);
+                } else {
+                    const storageKey = getStorageKeyForScope(scope);
+                    if (storageKey) {
+                        await browserAPI.storage.local.set({ [storageKey]: speed });
+                    }
                 }
             }
         } catch (storeError) {

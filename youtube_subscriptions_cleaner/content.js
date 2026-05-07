@@ -10,9 +10,11 @@ const NS = '[YT Subs Helper]';
 const TARGET_URL_PARTS = [
   '/@WorkshopCinemaHD',
   '/channel/UCbd7vzvz5wFe7r_KaW5tQUw', // FRESH Trailers
+  '/@FRESHTrailers',
   '/channel/UCEScTo5Hk1YXsCqGW1zgQEw', // топКино
   '/@KinoCheck.com',
   '/channel/UCOL10n-as9dXO2qtjjFUQbQ', // KinoCheck.com
+  '/@dimagavr',
 ];
 
 // Маркеры в тексте карточки
@@ -21,8 +23,11 @@ const TARGET_TEXT_MARKERS = [
   'workshop cinema hd',
   'fresh trailers',
   'freshtrailers',
+  '@freshtrailers',
   'топкино',
   'kinocheck.com',
+  'dimagavr',
+  '@dimagavr',
 ];
 
 // Маркеры во внутренних данных web‑компонентов
@@ -33,13 +38,37 @@ const TARGET_META_MARKERS = [
   'UCbd7vzvz5wFe7r_KaW5tQUw',
   'UCEScTo5Hk1YXsCqGW1zgQEw',
   'FRESH Trailers',
+  '@FRESHTrailers',
   'топКино',
   '@KinoCheck.com',
   'KinoCheck.com',
   'KinoCheck',
   'UCOL10n-as9dXO2qtjjFUQbQ',
+  '@dimagavr',
+  'dimagavr',
 ];
 const HIDDEN_CLASS = 'yt-hide-workshopcinemahd';
+/** Задержка перед скрытием карточки (мс): меньше «рваной» смены ленты. */
+const HIDE_DELAY_MS = 50;
+
+const pendingHideTimers = new WeakMap();
+
+function scheduleHideElement(el) {
+  if (!(el instanceof HTMLElement)) return;
+  if (el.classList.contains(HIDDEN_CLASS)) return;
+  if (pendingHideTimers.has(el)) return;
+
+  const timerId = setTimeout(() => {
+    pendingHideTimers.delete(el);
+    if (!el.isConnected) return;
+    if (!el.classList.contains(HIDDEN_CLASS)) {
+      el.classList.add(HIDDEN_CLASS);
+    }
+  }, HIDE_DELAY_MS);
+
+  pendingHideTimers.set(el, timerId);
+}
+
 const CARD_SELECTOR =
   'ytd-rich-item-renderer, yt-lockup-view-model, ytd-video-renderer, ytd-grid-video-renderer';
 const ROW_SELECTOR = 'ytd-rich-item-renderer, ytd-rich-grid-row';
@@ -142,7 +171,7 @@ function hideCardsForChannel(root) {
       if (!card) return;
 
       if (!card.classList.contains(HIDDEN_CLASS)) {
-        card.classList.add(HIDDEN_CLASS);
+        scheduleHideElement(card);
         log('hide card by link', part, card);
       }
     });
@@ -150,7 +179,7 @@ function hideCardsForChannel(root) {
     if (root.matches && root.matches(sel)) {
       const card = getCardElementFromLink(root);
       if (card && !card.classList.contains(HIDDEN_CLASS)) {
-        card.classList.add(HIDDEN_CLASS);
+        scheduleHideElement(card);
         log('hide card by link (root anchor)', part, card);
       }
     }
@@ -202,15 +231,15 @@ function hideCardsForChannel(root) {
     if (shouldHide) {
       const outer = card.closest(ROW_SELECTOR) || card;
       if (outer instanceof HTMLElement) {
-        outer.classList.add(HIDDEN_CLASS);
+        scheduleHideElement(outer);
         log('hide card by meta', outer);
       }
     }
   });
 }
 
-// Сразу обрабатываем только вставленное поддерево (в том же микротаске, до отрисовки).
-// Debounce по таймеру давал до ~120ms «мигания» карточек.
+// Сразу обрабатываем вставленное поддерево; скрытие откладывается на HIDE_DELAY_MS,
+// чтобы лента не «дёргалась» слишком резко.
 const observer = new MutationObserver((mutations) => {
   if (!isOnSubscriptionsPage()) return;
 
