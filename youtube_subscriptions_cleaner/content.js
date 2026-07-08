@@ -16,8 +16,9 @@ const TARGET_URL_PARTS = [
   '/channel/UCOL10n-as9dXO2qtjjFUQbQ', // KinoCheck.com
   '/@dimagavr',
 ];
+const TARGET_URL_PARTS_LC = TARGET_URL_PARTS.map((p) => p.toLowerCase());
 
-// Маркеры в тексте карточки
+// Маркеры в тексте карточки (в нижнем регистре)
 const TARGET_TEXT_MARKERS = [
   'workshopcinemahd',
   'workshop cinema hd',
@@ -26,11 +27,14 @@ const TARGET_TEXT_MARKERS = [
   '@freshtrailers',
   'топкино',
   'kinocheck.com',
+  'kinocheck',
   'dimagavr',
   '@dimagavr',
+  'дима гавр',
 ];
 
-// Маркеры во внутренних данных web‑компонентов
+// Маркеры во внутренних данных web‑компонентов (для старых Polymer-карточек;
+// новые yt-lockup-view-model не имеют __data — их ловим по href/тексту).
 const TARGET_META_MARKERS = [
   '@WorkshopCinemaHD',
   'WorkshopCinemaHD',
@@ -48,31 +52,20 @@ const TARGET_META_MARKERS = [
   'dimagavr',
 ];
 const HIDDEN_CLASS = 'yt-hide-workshopcinemahd';
-/** Задержка перед скрытием карточки (мс): меньше «рваной» смены ленты. */
-const HIDE_DELAY_MS = 50;
 
-const pendingHideTimers = new WeakMap();
-
-function scheduleHideElement(el) {
-  if (!(el instanceof HTMLElement)) return;
-  if (el.classList.contains(HIDDEN_CLASS)) return;
-  if (pendingHideTimers.has(el)) return;
-
-  const timerId = setTimeout(() => {
-    pendingHideTimers.delete(el);
-    if (!el.isConnected) return;
-    if (!el.classList.contains(HIDDEN_CLASS)) {
-      el.classList.add(HIDDEN_CLASS);
-    }
-  }, HIDE_DELAY_MS);
-
-  pendingHideTimers.set(el, timerId);
-}
-
-const CARD_SELECTOR =
-  'ytd-rich-item-renderer, yt-lockup-view-model, ytd-video-renderer, ytd-grid-video-renderer';
+// Карточка видео: старые ytd-* рендереры и новые view-model компоненты.
+const CARD_SELECTOR = [
+  'ytd-rich-item-renderer',
+  'yt-lockup-view-model',
+  'ytd-video-renderer',
+  'ytd-grid-video-renderer',
+].join(', ');
+// Верхний контейнер элемента сетки — скрываем его, чтобы не было дыр.
 const ROW_SELECTOR = 'ytd-rich-item-renderer, ytd-rich-grid-row';
 const STATUS_CONTAINER_ID = 'yt-important-subs-status';
+
+/** Троттлинг полного перескана ленты (мс). */
+const RESCAN_THROTTLE_MS = 400;
 
 // Каналы, за подпиской на которые нужно следить
 const IMPORTANT_CHANNELS = [
@@ -112,17 +105,6 @@ function injectStyles() {
   document.documentElement.appendChild(style);
 }
 
-function getCardElementFromLink(link) {
-  const innerCard = link.closest(CARD_SELECTOR);
-  if (!innerCard) return null;
-
-  // Поднимаемся до верхнего контейнера строки/карточки,
-  // чтобы не оставлять пустых чёрных полос.
-  const outerCard = innerCard.closest(ROW_SELECTOR) || innerCard;
-  if (!(outerCard instanceof HTMLElement)) return null;
-  return outerCard;
-}
-
 // Ограниченный обход вместо JSON.stringify: полный stringify по __data ломал
 // главный поток при частых мутациях и лента переставала подгружаться.
 const META_WALK_MAX_DEPTH = 5;
@@ -159,99 +141,101 @@ function objectContainsAnyMarker(value, markers, depth) {
   return false;
 }
 
-function hideCardsForChannel(root) {
-  if (!root || !root.querySelectorAll) return;
+/** Проверяет, относится ли карточка к одному из целевых каналов. */
+function cardMatchesTarget(card) {
+  // 1) По href любых ссылок внутри карточки
+  const links = card.querySelectorAll('a[href]');
+  for (const link of links) {
+    const href = (link.getAttribute('href') || '').toLowerCase();
+    if (!href) continue;
+    for (const part of TARGET_URL_PARTS_LC) {
+      if (href.includes(part)) return true;
+    }
+  }
 
-  // 1) По href: любые ссылки, ведущие на целевые каналы
-  TARGET_URL_PARTS.forEach((part) => {
-    const sel = `a[href*="${part}"]`;
-    const links = root.querySelectorAll(sel);
-    links.forEach((link) => {
-      const card = getCardElementFromLink(link);
-      if (!card) return;
+  // 2) По видимому тексту (имя канала на карточке)
+  const text = (card.textContent || '').toLowerCase();
+  if (text) {
+    for (const marker of TARGET_TEXT_MARKERS) {
+      if (text.includes(marker)) return true;
+    }
+  }
 
-      if (!card.classList.contains(HIDDEN_CLASS)) {
-        scheduleHideElement(card);
-        log('hide card by link', part, card);
-      }
-    });
-    // Вставленный узел может быть самой <a> — querySelectorAll не включает root.
-    if (root.matches && root.matches(sel)) {
-      const card = getCardElementFromLink(root);
-      if (card && !card.classList.contains(HIDDEN_CLASS)) {
-        scheduleHideElement(card);
-        log('hide card by link (root anchor)', part, card);
+  // 3) По внутренним данным Polymer-компонента (если ещё есть)
+  try {
+    const possibleData = [
+      card.data,
+      card.__data,
+      card.__data && card.__data.data,
+      card.__data && card.__data.hostElement && card.__data.hostElement.data,
+    ];
+    for (const d of possibleData) {
+      if (!d) continue;
+      if (objectContainsAnyMarker(d, TARGET_META_MARKERS, META_WALK_MAX_DEPTH)) {
+        return true;
       }
     }
+  } catch (e) {
+    // игнорируем ошибки обхода
+  }
+
+  return false;
+}
+
+/**
+ * Полный перескан ленты. YouTube переиспользует DOM-узлы при подгрузке
+ * (перепривязывает данные к существующим карточкам без добавления узлов),
+ * поэтому скрытие работает как переключение: несоответствующие карточки
+ * размаскировываются — иначе переиспользованная карточка «съедает» чужое
+ * видео и лента выглядит обрубленной.
+ */
+function rescanFeed() {
+  if (!isOnSubscriptionsPage()) return;
+
+  const cards = document.querySelectorAll(CARD_SELECTOR);
+  const outerStates = new Map();
+
+  cards.forEach((card) => {
+    if (!(card instanceof HTMLElement)) return;
+    const outer = card.closest(ROW_SELECTOR) || card;
+    if (!(outer instanceof HTMLElement)) return;
+
+    const matches = cardMatchesTarget(card);
+    // Один outer может содержать несколько карточек — скрываем, если совпала любая.
+    outerStates.set(outer, (outerStates.get(outer) || false) || matches);
   });
 
-  // Дополнительно ловим коллаборации, где handle может не быть в href,
-  // но есть в тексте карточки или во внутренних данных компонента.
-  const cards = new Set(root.querySelectorAll(CARD_SELECTOR));
-  if (root.matches && root.matches(CARD_SELECTOR)) {
-    cards.add(root);
-  }
-  cards.forEach((card) => {
-    if (!(card instanceof HTMLElement) || card.classList.contains(HIDDEN_CLASS)) return;
-
-    let shouldHide = false;
-
-    // 1) По видимому тексту
-    const text = (card.textContent || '').toLowerCase();
-    if (text) {
-      for (const marker of TARGET_TEXT_MARKERS) {
-        if (text.includes(marker)) {
-          shouldHide = true;
-          break;
-        }
-      }
-    }
-
-    // 2) По внутренним данным web‑компонента (__data / data)
-    if (!shouldHide) {
-      try {
-        const possibleData = [
-          card.data,
-          card.__data,
-          card.__data && card.__data.data,
-          card.__data && card.__data.hostElement && card.__data.hostElement.data,
-        ];
-        for (const d of possibleData) {
-          if (!d) continue;
-          if (objectContainsAnyMarker(d, TARGET_META_MARKERS, META_WALK_MAX_DEPTH)) {
-            shouldHide = true;
-            break;
-          }
-        }
-      } catch (e) {
-        // игнорируем ошибки обхода
-      }
-    }
-
-    if (shouldHide) {
-      const outer = card.closest(ROW_SELECTOR) || card;
-      if (outer instanceof HTMLElement) {
-        scheduleHideElement(outer);
-        log('hide card by meta', outer);
-      }
+  outerStates.forEach((shouldHide, outer) => {
+    const isHidden = outer.classList.contains(HIDDEN_CLASS);
+    if (shouldHide && !isHidden) {
+      outer.classList.add(HIDDEN_CLASS);
+      log('hide card', outer);
+    } else if (!shouldHide && isHidden) {
+      outer.classList.remove(HIDDEN_CLASS);
+      log('unhide recycled card', outer);
     }
   });
 }
 
-// Сразу обрабатываем вставленное поддерево; скрытие откладывается на HIDE_DELAY_MS,
-// чтобы лента не «дёргалась» слишком резко.
-const observer = new MutationObserver((mutations) => {
-  if (!isOnSubscriptionsPage()) return;
+let rescanTimer = null;
+let lastRescanAt = 0;
 
-  for (let i = 0; i < mutations.length; i++) {
-    const added = mutations[i].addedNodes;
-    for (let j = 0; j < added.length; j++) {
-      const node = added[j];
-      if (node instanceof HTMLElement) {
-        hideCardsForChannel(node);
-      }
-    }
-  }
+function scheduleRescan() {
+  if (rescanTimer !== null) return;
+  const elapsed = Date.now() - lastRescanAt;
+  const delay = Math.max(0, RESCAN_THROTTLE_MS - elapsed);
+  rescanTimer = setTimeout(() => {
+    rescanTimer = null;
+    lastRescanAt = Date.now();
+    rescanFeed();
+  }, delay);
+}
+
+// Наблюдаем постоянно: ловим и добавление узлов, и перепривязку данных
+// к существующим карточкам (меняются текст и атрибуты ссылок).
+const observer = new MutationObserver(() => {
+  if (!isOnSubscriptionsPage()) return;
+  scheduleRescan();
 });
 
 function startObserver() {
@@ -259,6 +243,9 @@ function startObserver() {
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['href'],
     });
   } catch (e) {
     // ignore
@@ -432,24 +419,27 @@ function initChannelAutoSubscribe() {
   tryClick();
 }
 
-function init() {
+function onPageActivated() {
   if (isOnSubscriptionsPage()) {
-    injectStyles();
-    hideCardsForChannel(document);
-    startObserver();
-
-    window.addEventListener('yt-navigate-finish', () => {
-      if (!isOnSubscriptionsPage()) return;
-      hideCardsForChannel(document);
-    });
-
-    log('init on subscriptions');
+    scheduleRescan();
+    log('activated on subscriptions');
   } else if (isOnImportantChannelPage()) {
     initChannelAutoSubscribe();
-    log('init on important channel');
-  } else {
-    log('not target page, idle');
+    log('activated on important channel');
   }
+}
+
+// Инициализируемся на любой странице YouTube: пользователь часто попадает
+// в ленту подписок SPA-переходом с главной, без перезагрузки страницы.
+function init() {
+  injectStyles();
+  startObserver();
+
+  window.addEventListener('yt-navigate-finish', onPageActivated);
+  window.addEventListener('yt-page-data-updated', onPageActivated);
+
+  onPageActivated();
+  log('init');
 }
 
 if (document.readyState === 'loading') {

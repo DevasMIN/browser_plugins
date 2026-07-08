@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Subscriptions – Hide WorkshopCinemaHD",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Скрывает видео от канала @WorkshopCinemaHD в ленте подписок YouTube",
   "permissions": [],
   "host_permissions": [
