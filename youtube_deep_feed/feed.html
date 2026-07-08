@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Deep Feed — подписки</title>
+  <link rel="stylesheet" href="feed.css">
+</head>
+<body>
+  <header id="topbar">
+    <h1>Deep Feed</h1>
+    <span id="stats"></span>
+    <div class="spacer"></div>
+    <input id="search" type="search" placeholder="Поиск по названию…">
+    <select id="channelFilter">
+      <option value="">Все каналы</option>
+    </select>
+    <label class="toggle"><input type="checkbox" id="hideWatched" checked> скрывать просмотренные</label>
+    <button id="btnSync" title="Подписки, новые видео и подкачка вглубь до запаса непросмотренных">Синхронизация</button>
+    <button id="btnHistory" title="Импорт отметок из истории просмотра YouTube">История</button>
+    <button id="btnChannels">Каналы</button>
+    <button id="btnExport" title="Сохранить все настройки и базу в файл (резервная копия / перенос)">Экспорт</button>
+    <button id="btnImport" title="Загрузить настройки и базу из файла">Импорт</button>
+    <input id="importFile" type="file" accept="application/json,.json" hidden>
+    <button id="btnAbort" class="danger" hidden>Стоп</button>
+  </header>
+
+  <div id="status" hidden>
+    <div id="statusText"></div>
+    <progress id="statusBar" max="100" value="0"></progress>
+  </div>
+
+  <section id="welcome" hidden>
+    <h2>Первый запуск</h2>
+    <p>Плагин соберёт собственную хронологическую ленту по всем вашим подпискам YouTube.</p>
+    <ol>
+      <li><b>Синхронизация</b> — список подписок и свежие видео каждого канала (пара минут).
+        Дальше плагин сам держит у каждого канала запас из ~20 непросмотренных видео,
+        докачивая старые по мере того, как вы смотрите.</li>
+      <li><b>История</b> — импорт отметок «просмотрено» из вашей истории YouTube.</li>
+    </ol>
+    <button id="btnStart">Начать первичную синхронизацию</button>
+  </section>
+
+  <aside id="channelPanel" hidden>
+    <header>
+      <h2>Каналы</h2>
+      <input id="channelSearch" type="search" placeholder="Найти канал…">
+      <button id="btnCloseChannels">✕</button>
+    </header>
+    <div id="channelList"></div>
+  </aside>
+
+  <button id="btnFresh" hidden>↑ новые</button>
+
+  <main id="feed"></main>
+  <div id="sentinel"></div>
+  <div id="feedEnd" hidden>— конец ленты —</div>
+
+  <div id="toast" hidden><span id="toastText"></span><button id="toastUndo">Отменить</button></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

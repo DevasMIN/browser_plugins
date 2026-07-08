@@ -1,1 +1,6 @@
 *.zip
+
+# Deep Feed: бэкапы содержат историю просмотров — не коммитить
+deepfeed-backup*.json
+*.pem
+.claude/

@@ -30,6 +30,19 @@ Blocks automatic video playback on YouTube when switching to a tab.
 - ✅ On/off toggle
 - ✅ Minimal performance impact
 
+### 3. YouTube Deep Feed 📜
+**Folder:** `youtube_deep_feed/`
+
+Own infinite chronological feed for all YouTube subscriptions — replaces the
+truncated native `/feed/subscriptions`.
+
+**Features:**
+- ✅ Full channel archives cached locally (IndexedDB)
+- ✅ Watched marks imported from YouTube history and progress bars
+- ✅ Hide videos or whole channels
+- ✅ Incremental sync of new videos
+- ✅ Search and per-channel filter
+
 ## 🌐 Language Support
 
 All plugins support:
