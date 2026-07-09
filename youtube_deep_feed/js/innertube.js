@@ -293,6 +293,24 @@ export function parseLockups(json) {
       const prog = collectKey(l.contentImage || {}, 'thumbnailOverlayProgressBarViewModel')[0];
       const chId =
         collectKey(l, 'browseId').find((b) => typeof b === 'string' && b.startsWith('UC')) || null;
+
+      // Тип видео: эфир / запланировано / запись стрима.
+      // Признаки: стиль или текст бейджа на превью, тексты метаданных.
+      const badgeTexts = badges.map((b) => b && b.text).filter((t) => typeof t === 'string');
+      const badgeStyles = badges.map((b) => (b && b.badgeStyle) || '').join(' ');
+      const allTexts = texts.concat(badgeTexts);
+      let kind = null;
+      if (/LIVE/i.test(badgeStyles) || allTexts.some((t) => /в эфире|прямой эфир|^live$|live now/i.test(t))) {
+        kind = 'live';
+      } else if (allTexts.some((t) => /премьера|запланирован|начн[её]тся|scheduled|premieres|upcoming/i.test(t))) {
+        kind = 'upcoming';
+      } else if (allTexts.some((t) => /трансляция закончилась|^streamed|stream ended/i.test(t))) {
+        kind = 'was_live';
+      }
+      const schedText =
+        kind === 'upcoming'
+          ? texts.find((t) => /премьера|запланирован|начн[её]тся|scheduled|premieres/i.test(t)) || null
+          : null;
       // Токен пункта меню «Скрыть» (есть только у элементов нативной ленты) —
       // с ним видео можно скрыть и на самом YouTube через /feedback
       let fbToken = null;
@@ -311,6 +329,8 @@ export function parseLockups(json) {
         dur,
         views,
         pubText,
+        kind,
+        schedText,
         percent: prog && typeof prog.startPercent === 'number' ? prog.startPercent : null,
       };
     });

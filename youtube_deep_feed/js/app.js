@@ -263,6 +263,9 @@ async function storeVideos(ch, lockups) {
     rows.push({
       id: v.id, ch: ch.id, title: v.title, dur: v.dur, views: v.views,
       pubText: v.pubText, ts, addedAt: existing?.addedAt ?? now,
+      // Тип (эфир/запланировано) берём из свежего парсинга: эфир заканчивается,
+      // премьера выходит — статус должен обновляться при каждой синхронизации
+      kind: v.kind ?? null, schedText: v.schedText ?? null,
       // Токен «Скрыть» приходит только из нативной ленты — не затираем его
       fbToken: existing?.fbToken ?? null,
     });
@@ -315,6 +318,7 @@ async function syncFeed() {
         rows.push({
           id: v.id, ch: v.chId, title: v.title, dur: v.dur, views: v.views,
           pubText: v.pubText, ts, addedAt: existing?.addedAt ?? now,
+          kind: v.kind ?? null, schedText: v.schedText ?? null,
           fbToken: v.fbToken || existing?.fbToken || null,
         });
       }
@@ -566,6 +570,13 @@ function makeCard(v) {
     dur.textContent = v.dur;
     thumb.appendChild(dur);
   }
+  if (v.kind) {
+    const kb = document.createElement('span');
+    kb.className = 'kbadge ' + v.kind;
+    kb.textContent =
+      v.kind === 'live' ? 'В ЭФИРЕ' : v.kind === 'upcoming' ? 'ЗАПЛАНИРОВАНО' : 'СТРИМ';
+    thumb.appendChild(kb);
+  }
   if (pct > 0) {
     const bar = document.createElement('div');
     bar.className = 'progress';
@@ -585,7 +596,8 @@ function makeCard(v) {
 
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.textContent = `${ch ? ch.title : '?'} • ${v.pubText || fmtDate(v.ts)}${v.views ? ' • ' + v.views : ''}`;
+  const dateText = v.kind === 'upcoming' && v.schedText ? v.schedText : v.pubText || fmtDate(v.ts);
+  meta.textContent = `${ch ? ch.title : '?'} • ${dateText}${v.views ? ' • ' + v.views : ''}`;
   card.appendChild(meta);
 
   const actions = document.createElement('div');
