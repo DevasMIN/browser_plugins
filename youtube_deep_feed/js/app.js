@@ -3,7 +3,7 @@
 import {
   browse, sendFeedback, addToWatchLater, removeFromWatchLater, fetchWatchLaterIds,
   collectKey, sleep, findToken, normThumbUrl,
-  parseChannels, parseLockups, parseHistory, parseRelativeDate,
+  parseChannels, parseLockups, parseHistory, parseRelativeDate, canonicalPubTs,
 } from './innertube.js';
 import * as db from './db.js';
 
@@ -251,9 +251,13 @@ async function storeVideos(ch, lockups) {
   let added = 0;
   for (const v of lockups) {
     const existing = await db.get('videos', v.id);
-    let ts = existing?.ts ?? parseRelativeDate(v.pubText, now);
+    const canon = canonicalPubTs(v.pubText, now);
+    let ts = existing?.ts ?? (canon ? canon.ts : null);
     // Дата не распарсилась — держим порядок плейлиста, вставая чуть раньше соседа
     if (ts == null) ts = prevTs != null ? prevTs - 1000 : now;
+    // Плейлист идёт от новых к старым: внутри одной «корзины» дат сохраняем
+    // порядок цепочкой −1с (иначе одинаковые канонические метки перемешаются)
+    if (!existing && prevTs != null && ts >= prevTs) ts = prevTs - 1000;
     prevTs = ts;
     if (!existing) added++;
     rows.push({
@@ -291,6 +295,7 @@ async function syncFeed() {
   } catch (e) {
     return 0; // лента недоступна — не страшно, основной источник — плейлисты
   }
+  let prevFeedTs = null;
   for (let page = 0; page < 60; page++) {
     checkAbort();
     const rows = [];
@@ -301,9 +306,15 @@ async function syncFeed() {
       if (v.chId && state.channels.has(v.chId)) {
         const existing = await db.get('videos', v.id);
         if (!existing) newCount++;
+        // Каноничная метка + цепочка −1с: лента идёт от новых к старым,
+        // сохраняем её порядок внутри одинаковых «корзин» дат
+        const canon = canonicalPubTs(v.pubText, now);
+        let ts = existing?.ts ?? (canon ? canon.ts : now);
+        if (!existing && prevFeedTs != null && ts >= prevFeedTs) ts = prevFeedTs - 1000;
+        prevFeedTs = ts;
         rows.push({
           id: v.id, ch: v.chId, title: v.title, dur: v.dur, views: v.views,
-          pubText: v.pubText, ts: existing?.ts ?? ts0 ?? now, addedAt: existing?.addedAt ?? now,
+          pubText: v.pubText, ts, addedAt: existing?.addedAt ?? now,
           fbToken: v.fbToken || existing?.fbToken || null,
         });
       }
@@ -940,6 +951,30 @@ async function init() {
     if (SYNCABLE_HIDE_SRC.has(h.src) || h.src === 'sync') state.hiddenSync.add(h.id);
   }
   state.wl = new Set(await db.metaGet('wl', []));
+
+  // Одноразовая миграция меток времени (v0.9.10): раньше метка считалась от
+  // момента синхронизации конкретного канала, и внутри одной «корзины» дат
+  // («8 месяцев назад») лента группировалась блоками по каналам. Пересчитываем
+  // в канонические метки; внутри корзины расталкиваем детерминированно по id,
+  // чтобы каналы перемешались.
+  if (!(await db.metaGet('tsCanonical'))) {
+    status('Разовая миграция дат…');
+    const all = await db.getAll('videos');
+    const hash = (s) => {
+      let h = 0;
+      for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+      return h;
+    };
+    for (const v of all) {
+      const canon = canonicalPubTs(v.pubText, v.addedAt || Date.now());
+      if (canon) {
+        v.ts = canon.ts - (hash(v.id) % Math.max(1000, Math.floor(canon.g / 2)));
+      }
+    }
+    await db.bulkPut('videos', all);
+    await db.metaSet('tsCanonical', 1);
+    status('');
+  }
 
   // Синхронизация скрытого между устройствами (chrome.storage.sync)
   if (chrome.storage && chrome.storage.sync) {

@@ -350,28 +350,50 @@ export function normThumbUrl(url) {
 
 // ---------- Относительные даты ----------
 
+// [регэксп единицы, длительность единицы, гранулярность округления]
+// Гранулярность = реальная точность даты: «8 месяцев назад» знает дату
+// с точностью до дня, «5 часов назад» — до часа.
 const UNIT_MS = [
-  [/сек|second/i, 1e3],
-  [/мин|minute/i, 60e3],
-  [/час|hour/i, 3600e3],
-  [/\bдн|день|day/i, 86400e3],
-  [/недел|week/i, 7 * 86400e3],
-  [/месяц|month/i, 30.44 * 86400e3],
-  [/год|лет|year/i, 365.25 * 86400e3],
+  [/сек|second/i, 1e3, 60e3],
+  [/мин|minute/i, 60e3, 60e3],
+  [/час|hour/i, 3600e3, 3600e3],
+  [/\bдн|день|day/i, 86400e3, 86400e3],
+  [/недел|week/i, 7 * 86400e3, 86400e3],
+  [/месяц|month/i, 30.44 * 86400e3, 86400e3],
+  [/год|лет|year/i, 365.25 * 86400e3, 86400e3],
 ];
+
+function matchRelativeDate(text) {
+  if (!text) return null;
+  const t = text.replace(/^(Трансляция закончилась|Премьера состоялась|Streamed|Premiered)\s*/i, '');
+  const m = t.match(/(\d+)\s*(\S+)/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  for (const [re, ms, g] of UNIT_MS) {
+    if (re.test(m[2])) return { n, ms, g };
+  }
+  return null;
+}
 
 /**
  * «18 часов назад» / «2 years ago» → примерный timestamp публикации.
  * Точность падает с возрастом видео — для сортировки этого достаточно.
  */
 export function parseRelativeDate(text, now = Date.now()) {
-  if (!text) return null;
-  const t = text.replace(/^(Трансляция закончилась|Премьера состоялась|Streamed|Premiered)\s*/i, '');
-  const m = t.match(/(\d+)\s*(\S+)/);
+  const m = matchRelativeDate(text);
+  return m ? now - m.n * m.ms : null;
+}
+
+/**
+ * Каноничная метка публикации: оценка «now − n·unit», округлённая вниз до
+ * гранулярности единицы. Без округления одинаковые даты («8 месяцев назад»)
+ * у разных каналов расходились на секунды (каналы синхронизируются по очереди),
+ * и лента внутри одной «корзины» дат группировалась блоками по каналам.
+ * Возвращает { ts, g } или null.
+ */
+export function canonicalPubTs(text, now = Date.now()) {
+  const m = matchRelativeDate(text);
   if (!m) return null;
-  const n = parseInt(m[1], 10);
-  for (const [re, ms] of UNIT_MS) {
-    if (re.test(m[2])) return now - n * ms;
-  }
-  return null;
+  const raw = now - m.n * m.ms;
+  return { ts: Math.floor(raw / m.g) * m.g, g: m.g };
 }
