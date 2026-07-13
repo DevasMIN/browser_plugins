@@ -1022,8 +1022,10 @@ async function init() {
 
   // Автосинхронизация: лёгкая проверка ленты каждые 15 минут,
   // полный обход каналов — раз в 6 часов. Работает, пока страница открыта.
+  let lastAutoTick = 0;
   async function autoTick() {
     if (state.syncing) return;
+    lastAutoTick = Date.now();
     const last = await db.metaGet('lastQuickSync', 0);
     if (Date.now() - last > FULL_SYNC_INTERVAL) {
       await runTask(fullSync, true);
@@ -1037,6 +1039,25 @@ async function init() {
     autoTick(); // сразу при открытии
   }
   setInterval(autoTick, AUTO_FEED_INTERVAL);
+
+  // Opera усыпляет фоновые вкладки — интервал в спячке не тикает, и после
+  // возврата лента выглядит замороженной. Поэтому синхронизируемся сразу при
+  // возврате на вкладку/фокусе, если с прошлого тика прошло больше 3 минут.
+  const tickIfStale = () => {
+    if (document.hidden || state.syncing) return;
+    if (Date.now() - lastAutoTick > 3 * 60e3) autoTick();
+  };
+  document.addEventListener('visibilitychange', tickIfStale);
+  window.addEventListener('focus', tickIfStale);
+
+  // «↑ N новых» применяется само, когда пользователь доскроллил к верху
+  window.addEventListener('scroll', () => {
+    if (state.pendingNew > 0 && window.scrollY < 100) {
+      state.pendingNew = 0;
+      $('btnFresh').hidden = true;
+      resetFeed();
+    }
+  }, { passive: true });
 
   // Кнопки
   $('btnStart').onclick = () =>
