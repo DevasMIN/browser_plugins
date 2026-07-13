@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Deep Feed",
-  "version": "0.9.11",
+  "version": "0.9.12",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA+8LH45e4syT5sOyS74N6oSWckv3v84Oad/zk7+eADXxCHdGbhq4OyKiRtwit77QdHEJnLaybWYKPtQ89ufCCQZ2oSXUJeHbqvrrYi7Xa7nM0rfgcSJG+/GUHashJWMpQImu//U2wRWSczhab2xv83nTPvTe0bjLcJUz/F/YbQO6xytr9EfvgWNmM45k5YPak+R3UYO1LvoQ0ANuQMRF3zqoWw/Ms13GQODIgX44qz5mjmBJAGAT3G3PhqC+42OqUjR2IRf05spSjYoV2d9jPxDNaOIx7Z9EHkkQLjDxvbDGQvnFa6Ty1GDsPkj9uvj39VtOdNDpIj3wr+NQ8HJBabwIDAQAB",
   "description": "Собственная бесконечная хронологическая лента по всем подпискам: локальный кэш, скрытие видео/каналов, автоотметка просмотренного из истории YouTube",
   "permissions": ["storage", "unlimitedStorage", "cookies", "tabs", "declarativeNetRequestWithHostAccess"],

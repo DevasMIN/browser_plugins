@@ -332,15 +332,17 @@ async function syncFeed() {
     json = await browse({ continuation: token });
   }
 
-  // Дифф скрытых: только по здоровой ленте и только внутри её окна,
-  // с отступами от краёв (свежак ещё не везде разложен, край окна неточен)
+  // Дифф скрытых: внутри фактического окна ленты (от самого старого её видео),
+  // с отступами от краёв. Старый край: дата «N дней назад» имеет точность в день,
+  // видео чуть старше края могло просто не попасть в окно. Свежий край: новое
+  // видео появляется в ленте с небольшим лагом — 12 часов запаса хватает.
   const windowDays = (now - minTs) / 86400e3;
-  if (feedIds.size < 100 || windowDays < 7) {
-    status(`Лента YouTube: ${feedIds.size} видео — мало для диффа скрытых, пропускаю`);
+  if (feedIds.size < 20 || windowDays < 2) {
+    status(`Лента YouTube: ${feedIds.size} видео, окно ${windowDays.toFixed(1)} дн — для диффа скрытых нужно ≥20 видео и ≥2 дней, пропускаю`);
     return newCount;
   }
   const oldEdge = minTs + 86400e3;
-  const newEdge = now - 2 * 86400e3;
+  const newEdge = now - 12 * 3600e3;
   const rows = [];
   for (const v of await db.getAll('videos')) {
     if (v.ts <= oldEdge || v.ts >= newEdge) continue;
