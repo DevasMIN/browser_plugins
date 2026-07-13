@@ -35,8 +35,8 @@ chrome.runtime.onInstalled.addListener(installDnrRule);
 chrome.runtime.onStartup.addListener(installDnrRule);
 installDnrRule();
 
-// По клику на иконку открываем (или активируем уже открытую) страницу ленты
-chrome.action.onClicked.addListener(async () => {
+// Открывает (или активирует уже открытую) страницу ленты
+async function openFeed() {
   const url = chrome.runtime.getURL('feed.html');
   const tabs = await chrome.tabs.query({ url });
   if (tabs.length) {
@@ -45,4 +45,9 @@ chrome.action.onClicked.addListener(async () => {
   } else {
     await chrome.tabs.create({ url });
   }
+}
+
+chrome.action.onClicked.addListener(openFeed);
+chrome.commands.onCommand.addListener((cmd) => {
+  if (cmd === 'open-feed') openFeed();
 });
