@@ -185,16 +185,28 @@ async function refreshWatchLater() {
 
 // ---------- Синхронизация ----------
 
+/** Удаляет канал и все его видео из базы (после отписки). */
+async function removeChannel(chId) {
+  const vids = await db.getAllByIndex('videos', 'ch', chId);
+  for (const v of vids) {
+    await db.del('videos', v.id);
+    state.hidden.delete(v.id);
+  }
+  state.channels.delete(chId);
+  await db.del('channels', chId);
+}
+
 /** Список подписок: FEchannels + продолжения. */
 async function syncChannels() {
   status('Читаю список подписок…');
   let json = await browse({ browseId: 'FEchannels' });
   const found = [];
+  let complete = false;
   for (let page = 0; page < 30; page++) {
     checkAbort();
     found.push(...parseChannels(json));
     const token = findToken(json);
-    if (!token) break;
+    if (!token) { complete = true; break; }
     await sleep(REQUEST_DELAY);
     json = await browse({ continuation: token });
   }
@@ -211,7 +223,21 @@ async function syncChannels() {
     state.channels.set(ch.id, row);
   }
   await db.bulkPut('channels', [...state.channels.values()]);
-  status(`Подписок: ${found.length} (новых: ${added})`);
+
+  // Отписки: канал есть в базе, но его больше нет в списке подписок. Удаляем
+  // его и его видео — иначе они продолжают висеть в ленте. Только если список
+  // подписок дочитан полностью (иначе оборванная выдача снесла бы полбазы).
+  let removed = 0;
+  if (complete) {
+    const subscribedIds = new Set(found.map((c) => c.id));
+    for (const chId of [...state.channels.keys()]) {
+      if (!subscribedIds.has(chId)) {
+        await removeChannel(chId);
+        removed++;
+      }
+    }
+  }
+  status(`Подписок: ${found.length} (новых: ${added}${removed ? `, убрано отписанных: ${removed}` : ''})`);
   return found.length;
 }
 
