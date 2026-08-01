@@ -368,21 +368,39 @@ async function syncFeed() {
     status(
       `Лента YouTube отдала всего ${feedIds.size} видео за последние ${windowDays.toFixed(1)} дн. — `
       + `слишком мало, чтобы надёжно понять, какие видео вы скрыли на самом YouTube `
-      + `(нужно ≥20 видео и охват ≥2 дней). Это не ошибка — сверка скрытых просто пропущена в этот раз.`
+      + `(нужно ≥20 видео и охват ≥2 дней), сверка скрытых пропущена.`
     );
     return newCount;
   }
   const oldEdge = minTs + 86400e3;
   const newEdge = now - 12 * 3600e3;
   const rows = [];
+  let inWindow = 0;
   for (const v of await db.getAll('videos')) {
     if (v.ts <= oldEdge || v.ts >= newEdge) continue;
-    if (feedIds.has(v.id) || state.hidden.has(v.id)) continue;
     const ch = state.channels.get(v.ch);
     if (!ch || ch.hiddenChannel || !ch.enabled) continue;
-    state.hidden.add(v.id);
+    inWindow++;
+    if (feedIds.has(v.id) || state.hidden.has(v.id)) continue;
     rows.push({ id: v.id, at: now, src: 'feed-diff' });
   }
+
+  // Предохранитель. Дифф исходит из того, что нативная лента внутри окна полна:
+  // всё, чего в ней нет, — скрыто пользователем. Но YouTube регулярно отдаёт
+  // ленту урезанной (обрыв пагинации, пересборка после правки подписок), и тогда
+  // «скрытым» окажется почти всё окно разом. Отличить одно от другого можно
+  // только по доле: скрыть половину собственных подписок — не норма.
+  const share = inWindow ? rows.length / inWindow : 0;
+  if (share > 0.5) {
+    status(
+      `Лента YouTube выглядит неполной: в окне ${windowDays.toFixed(1)} дн. у неё ${feedIds.size} видео `
+      + `против ${inWindow} в базе (${Math.round(share * 100)}% пришлось бы пометить скрытыми). `
+      + `Сверка скрытых пропущена, чтобы не вычистить ленту.`
+    );
+    return newCount;
+  }
+
+  for (const r of rows) state.hidden.add(r.id);
   await db.bulkPut('hidden', rows);
   status(`Лента YouTube: ${feedIds.size} видео, распознано скрытых: ${rows.length}`);
   return newCount;
@@ -997,6 +1015,17 @@ async function init() {
   }
   state.wl = new Set(await db.metaGet('wl', []));
 
+  const idHash = (s) => {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return h;
+  };
+  /** Каноничная метка с детерминированным разбросом внутри «корзины» дат. */
+  const canonTs = (v) => {
+    const canon = canonicalPubTs(v.pubText, v.addedAt || Date.now());
+    return canon ? canon.ts - (idHash(v.id) % Math.max(1000, Math.floor(canon.g / 2))) : null;
+  };
+
   // Одноразовая миграция меток времени (v0.9.10): раньше метка считалась от
   // момента синхронизации конкретного канала, и внутри одной «корзины» дат
   // («8 месяцев назад») лента группировалась блоками по каналам. Пересчитываем
@@ -1005,20 +1034,35 @@ async function init() {
   if (!(await db.metaGet('tsCanonical'))) {
     status('Разовая миграция дат…');
     const all = await db.getAll('videos');
-    const hash = (s) => {
-      let h = 0;
-      for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-      return h;
-    };
     for (const v of all) {
-      const canon = canonicalPubTs(v.pubText, v.addedAt || Date.now());
-      if (canon) {
-        v.ts = canon.ts - (hash(v.id) % Math.max(1000, Math.floor(canon.g / 2)));
-      }
+      const ts = canonTs(v);
+      if (ts != null) v.ts = ts;
     }
     await db.bulkPut('videos', all);
     await db.metaSet('tsCanonical', 1);
     status('');
+  }
+
+  // Миграция v0.9.16: из-за ASCII-семантики \b в JS регэксп «\bдн» не совпадал
+  // с кириллицей, и даты «2 дня»/«5 дней назад» не парсились вовсе — таким
+  // видео ставилась метка цепочкой от соседа (фактически «почти сейчас»).
+  // Пересчитываем их: без этого лента остаётся с перекошенным порядком, а дифф
+  // скрытых их не видит, потому что они не попадают в окно по дате.
+  if (!(await db.metaGet('tsDaysFix'))) {
+    status('Разовая миграция дат (дни)…');
+    const all = await db.getAll('videos');
+    const fixed = [];
+    for (const v of all) {
+      if (!/дн/i.test(v.pubText || '')) continue;
+      const ts = canonTs(v);
+      if (ts != null && ts !== v.ts) {
+        v.ts = ts;
+        fixed.push(v);
+      }
+    }
+    await db.bulkPut('videos', fixed);
+    await db.metaSet('tsDaysFix', 1);
+    status(fixed.length ? `Пересчитано дат: ${fixed.length}` : '');
   }
 
   // Синхронизация скрытого между устройствами (chrome.storage.sync)
