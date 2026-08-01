@@ -423,3 +423,40 @@ export function canonicalPubTs(text, now = Date.now()) {
   const raw = now - m.n * m.ms;
   return { ts: Math.floor(raw / m.g) * m.g, g: m.g };
 }
+
+/**
+ * Интервал, в который обязана попадать метка публикации при такой подписи:
+ * «2 дня назад» YouTube показывает, пока видео от 2 до 3 дней. Нужен, чтобы
+ * отличить корректную (более точную) сохранённую метку от испорченной.
+ * Возвращает { lo, hi } — ts допустим в (lo, hi] — или null.
+ */
+export function pubTsRange(text, now = Date.now()) {
+  const m = matchRelativeDate(text);
+  if (!m) return null;
+  return { lo: now - (m.n + 1) * m.ms, hi: now - m.n * m.ms };
+}
+
+const RTF = new Intl.RelativeTimeFormat('ru', { numeric: 'always' });
+const REL_UNITS = [
+  ['year', 365.25 * 86400e3],
+  ['month', 30.44 * 86400e3],
+  ['week', 7 * 86400e3],
+  ['day', 86400e3],
+  ['hour', 3600e3],
+  ['minute', 60e3],
+];
+
+/**
+ * «18 часов назад» из метки времени — как это делает сам YouTube (с округлением
+ * вниз). Подпись считается из ts, а не хранится текстом: сохранённый текст
+ * замерзает на моменте первой индексации (видео уходит из ленты и больше не
+ * перечитывается), и тогда «1 час назад» висит на видео недельной давности.
+ */
+export function fmtRelative(ts, now = Date.now()) {
+  const d = Math.max(0, now - ts);
+  for (const [unit, ms] of REL_UNITS) {
+    const n = Math.floor(d / ms);
+    if (n >= 1) return RTF.format(-n, unit);
+  }
+  return 'только что';
+}

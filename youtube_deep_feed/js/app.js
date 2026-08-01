@@ -4,6 +4,7 @@ import {
   browse, sendFeedback, addToWatchLater, removeFromWatchLater, fetchWatchLaterIds,
   collectKey, sleep, findToken, normThumbUrl,
   parseChannels, parseLockups, parseHistory, parseRelativeDate, canonicalPubTs,
+  pubTsRange, fmtRelative,
 } from './innertube.js';
 import * as db from './db.js';
 
@@ -25,6 +26,20 @@ const HISTORY_KNOWN_STOP = 300;
  * Возобновляемо: кнопка «История» продолжит с сохранённого места.
  */
 const HISTORY_MAX_PAGES = 40;
+
+const idHash = (s) => {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+};
+
+/**
+ * Метка времени из каноничной даты: внутри одной «корзины» («8 месяцев назад»)
+ * видео детерминированно расталкиваются по id, иначе лента группируется
+ * блоками по каналам — они синхронизируются по очереди.
+ */
+const stableTs = (canon, id) =>
+  canon.ts - (idHash(id) % Math.max(1000, Math.floor(canon.g / 2)));
 
 const state = {
   channels: new Map(),   // id -> запись канала
@@ -278,12 +293,17 @@ async function storeVideos(ch, lockups) {
   for (const v of lockups) {
     const existing = await db.get('videos', v.id);
     const canon = canonicalPubTs(v.pubText, now);
-    let ts = existing?.ts ?? (canon ? canon.ts : null);
-    // Дата не распарсилась — держим порядок плейлиста, вставая чуть раньше соседа
-    if (ts == null) ts = prevTs != null ? prevTs - 1000 : now;
-    // Плейлист идёт от новых к старым: внутри одной «корзины» дат сохраняем
-    // порядок цепочкой −1с (иначе одинаковые канонические метки перемешаются)
-    if (!existing && prevTs != null && ts >= prevTs) ts = prevTs - 1000;
+    let ts = existing?.ts ?? null;
+    if (ts == null) {
+      // Дата не распарсилась — держим порядок плейлиста, вставая чуть раньше соседа
+      ts = canon ? stableTs(canon, v.id) : (prevTs != null ? prevTs - 1000 : now);
+      // Плейлист идёт от новых к старым: внутри одной «корзины» дат сохраняем
+      // его порядок цепочкой −1с. Только внутри корзины: раньше цепочка тянулась
+      // от любого соседа и утаскивала свежее видео к метке сильно старшего.
+      if (canon && prevTs != null && ts >= prevTs && prevTs > canon.ts - canon.g) {
+        ts = prevTs - 1000;
+      }
+    }
     prevTs = ts;
     if (!existing) added++;
     rows.push({
@@ -336,11 +356,28 @@ async function syncFeed() {
       if (v.chId && state.channels.has(v.chId)) {
         const existing = await db.get('videos', v.id);
         if (!existing) newCount++;
-        // Каноничная метка + цепочка −1с: лента идёт от новых к старым,
-        // сохраняем её порядок внутри одинаковых «корзин» дат
         const canon = canonicalPubTs(v.pubText, now);
-        let ts = existing?.ts ?? (canon ? canon.ts : now);
-        if (!existing && prevFeedTs != null && ts >= prevFeedTs) ts = prevFeedTs - 1000;
+        let ts = existing?.ts ?? null;
+        // Самолечение: в ленте подпись всегда свежая, поэтому она — надёжный
+        // ориентир. Если сохранённая метка не попадает в интервал, который
+        // задаёт подпись, значит она испорчена (раньше свежему видео могла
+        // достаться метка соседа) — считаем заново. Метку внутри интервала не
+        // трогаем: она точнее, её ставили по более мелкой единице времени.
+        const range = pubTsRange(v.pubText, now);
+        if (ts != null && range && (ts <= range.lo || ts > range.hi)) ts = null;
+        // Эфиры и премьеры дату не показывают, интервалом их не проверить. Но
+        // метка без даты ставится моментом появления в базе, поэтому «датировано
+        // заметно раньше, чем добавлено» бывает только у доставшейся от соседа.
+        if (ts != null && !range && existing && ts < existing.addedAt - 3600e3) ts = null;
+        if (ts == null) {
+          // Без даты (эфиры, премьеры) — видео из ленты всегда актуальное
+          ts = canon ? stableTs(canon, v.id) : now;
+          // Лента идёт от новых к старым: внутри одной «корзины» дат сохраняем
+          // её порядок цепочкой −1с (только внутри корзины, см. storeVideos)
+          if (canon && prevFeedTs != null && ts >= prevFeedTs && prevFeedTs > canon.ts - canon.g) {
+            ts = prevFeedTs - 1000;
+          }
+        }
         prevFeedTs = ts;
         rows.push({
           id: v.id, ch: v.chId, title: v.title, dur: v.dur, views: v.views,
@@ -595,10 +632,6 @@ function acceptVideo(v) {
   return true;
 }
 
-function fmtDate(ts) {
-  return new Date(ts).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short', year: 'numeric' });
-}
-
 function makeCard(v) {
   const ch = state.channels.get(v.ch);
   const pct = state.watched.get(v.id) ?? 0;
@@ -647,7 +680,11 @@ function makeCard(v) {
 
   const meta = document.createElement('div');
   meta.className = 'meta';
-  const dateText = v.kind === 'upcoming' && v.schedText ? v.schedText : v.pubText || fmtDate(v.ts);
+  // Дата считается из ts — той же величины, по которой лента отсортирована,
+  // поэтому подпись и позиция не могут разойтись. Хранимый pubText для этого
+  // не годится: он замерзает, когда видео перестаёт попадать в синхронизацию.
+  const dateText =
+    v.kind === 'upcoming' && v.schedText ? v.schedText : fmtRelative(v.ts);
   meta.textContent = `${ch ? ch.title : '?'} • ${dateText}${v.views ? ' • ' + v.views : ''}`;
   card.appendChild(meta);
 
@@ -1015,15 +1052,10 @@ async function init() {
   }
   state.wl = new Set(await db.metaGet('wl', []));
 
-  const idHash = (s) => {
-    let h = 0;
-    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-    return h;
-  };
-  /** Каноничная метка с детерминированным разбросом внутри «корзины» дат. */
+  /** Каноничная метка видео, посчитанная от момента его попадания в базу. */
   const canonTs = (v) => {
     const canon = canonicalPubTs(v.pubText, v.addedAt || Date.now());
-    return canon ? canon.ts - (idHash(v.id) % Math.max(1000, Math.floor(canon.g / 2))) : null;
+    return canon ? stableTs(canon, v.id) : null;
   };
 
   // Одноразовая миграция меток времени (v0.9.10): раньше метка считалась от
