@@ -292,8 +292,9 @@ async function storeVideos(ch, lockups) {
       // Тип (эфир/запланировано) берём из свежего парсинга: эфир заканчивается,
       // премьера выходит — статус должен обновляться при каждой синхронизации
       kind: v.kind ?? null, schedText: v.schedText ?? null,
-      // Токен «Скрыть» приходит только из нативной ленты — не затираем его
-      fbToken: existing?.fbToken ?? null,
+      // Токен «Скрыть» бывает и у элементов плейлиста загрузок — берём свежий,
+      // если он есть, иначе не теряем ранее найденный (например, из ленты)
+      fbToken: v.fbToken || existing?.fbToken || null,
     });
     await noteWatched(v.id, v.percent, 'playlist');
   }
@@ -364,7 +365,11 @@ async function syncFeed() {
   // видео появляется в ленте с небольшим лагом — 12 часов запаса хватает.
   const windowDays = (now - minTs) / 86400e3;
   if (feedIds.size < 20 || windowDays < 2) {
-    status(`Лента YouTube: ${feedIds.size} видео, окно ${windowDays.toFixed(1)} дн — для диффа скрытых нужно ≥20 видео и ≥2 дней, пропускаю`);
+    status(
+      `Лента YouTube отдала всего ${feedIds.size} видео за последние ${windowDays.toFixed(1)} дн. — `
+      + `слишком мало, чтобы надёжно понять, какие видео вы скрыли на самом YouTube `
+      + `(нужно ≥20 видео и охват ≥2 дней). Это не ошибка — сверка скрытых просто пропущена в этот раз.`
+    );
     return newCount;
   }
   const oldEdge = minTs + 86400e3;
@@ -1102,6 +1107,7 @@ async function init() {
     resetFeed();
   };
   $('btnHistory').onclick = () => runTask(importHistory);
+  $('btnYoutube').onclick = () => window.open('https://www.youtube.com/feed/subscriptions', '_blank');
   $('btnAbort').onclick = () => { state.abort = true; };
   $('btnChannels').onclick = () => {
     $('channelPanel').hidden = false;
