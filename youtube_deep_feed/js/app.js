@@ -698,7 +698,9 @@ function makeCard(v) {
   actions.className = 'actions';
   const btnL = document.createElement('button');
   btnL.textContent = '⏳ позже';
-  btnL.title = 'Добавить в «Смотреть позже» на YouTube и убрать из ленты';
+  btnL.title = v.fbToken
+    ? 'Добавить в «Смотреть позже» на YouTube и скрыть из этой ленты и из ленты YouTube'
+    : 'Добавить в «Смотреть позже» на YouTube и убрать из ленты';
   btnL.onclick = () => watchLater(v, card, btnL);
   const btnW = document.createElement('button');
   btnW.textContent = isWatchedVideo(v) ? '↩ не смотрел' : '✓ просмотрено';
@@ -783,6 +785,26 @@ function undoTokenFromFeedback(resp, usedToken) {
   return toks[0] || null;
 }
 
+/**
+ * Отправляет «Не интересует» по fbToken видео (если он есть) — тем же путём
+ * пользуются и «✕ скрыть», и «⏳ позже», чтобы не заставлять кликать дважды.
+ * Возвращает {ok, undoToken}: ok=false, если токена нет, запрос упал или
+ * сервер ответил пустышкой (значит реально ничего не скрылось).
+ */
+async function feedbackHide(v) {
+  if (!v.fbToken) return { ok: false, undoToken: null };
+  try {
+    const resp = await sendFeedback(v.fbToken);
+    const undoToken = undoTokenFromFeedback(resp, v.fbToken);
+    const ok = !!(resp && Object.keys(resp).length);
+    if (!ok) console.warn('feedback: пустой ответ на токен', v.id);
+    return { ok, undoToken };
+  } catch (e) {
+    console.warn('feedback fail', v.id, e);
+    return { ok: false, undoToken: null };
+  }
+}
+
 async function hideVideo(v, card) {
   const parent = card.parentNode;
   const nextCard = card.nextSibling;
@@ -790,21 +812,7 @@ async function hideVideo(v, card) {
   card.remove();
 
   // Если видео пришло из нативной ленты — скрываем и на YouTube
-  let undoToken = null;
-  let fbOk = false;
-  if (v.fbToken) {
-    try {
-      const resp = await sendFeedback(v.fbToken);
-      undoToken = undoTokenFromFeedback(resp, v.fbToken);
-      // Раньше «(и на YouTube)» показывалось всегда, если у видео был fbToken,
-      // даже если запрос упал или сервер прислал пустышку — сообщение врало об
-      // успехе. Теперь считаем успехом только осмысленный ответ.
-      fbOk = !!(resp && Object.keys(resp).length);
-      if (!fbOk) console.warn('feedback: пустой ответ на токен', v.id);
-    } catch (e) {
-      console.warn('feedback fail', v.id, e);
-    }
-  }
+  const { ok: fbOk, undoToken } = await feedbackHide(v);
 
   showToast(fbOk ? 'Скрыто (и на YouTube)' : 'Скрыто', async () => {
     await removeHidden(v.id);
@@ -825,8 +833,14 @@ async function watchLater(v, card, btn) {
     state.wl.add(v.id);
     await addHidden(v.id, 'wl');
     card.remove();
-    showToast('В «Смотреть позже»', async () => {
+    // Заодно скрываем и в нативной ленте YouTube — чтобы не кликать отдельно
+    // «✕ скрыть» на то же видео.
+    const { ok: fbOk, undoToken } = await feedbackHide(v);
+    showToast(fbOk ? 'В «Смотреть позже» (и скрыто на YouTube)' : 'В «Смотреть позже»', async () => {
       try { await removeFromWatchLater(v.id); } catch (e) { /* останется в WL */ }
+      if (undoToken) {
+        try { await sendFeedback(undoToken); } catch (e) { /* уже локально вернули */ }
+      }
       state.wl.delete(v.id);
       await removeHidden(v.id);
       restoreCard(card, parent, nextCard);
