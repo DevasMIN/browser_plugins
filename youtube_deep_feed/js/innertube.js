@@ -6,11 +6,14 @@ const YT = 'https://www.youtube.com';
 
 let cachedCfg = null;
 
-/** API-ключ и версия клиента из HTML любой страницы YouTube (кэш 12ч). */
+/** API-ключ, версия клиента и visitorData из HTML любой страницы YouTube (кэш 12ч). */
 export async function getConfig() {
-  if (cachedCfg) return cachedCfg;
+  // visitor — добавлено позже: старый закэшированный itCfg без него форсируем
+  // перечитать, иначе мутирующие вызовы (feedback и т.п.) остаются без него
+  // до истечения TTL.
+  if (cachedCfg && cachedCfg.visitor) return cachedCfg;
   const stored = await chrome.storage.local.get('itCfg');
-  if (stored.itCfg && Date.now() - stored.itCfg.at < 12 * 3600e3) {
+  if (stored.itCfg && stored.itCfg.visitor && Date.now() - stored.itCfg.at < 12 * 3600e3) {
     cachedCfg = stored.itCfg;
     return cachedCfg;
   }
@@ -18,8 +21,14 @@ export async function getConfig() {
   const html = await r.text();
   const key = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/)?.[1];
   const ver = html.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION":"([^"]+)"/)?.[1];
+  // visitorData: реальный youtube.com шлёт его в каждом запросе к innertube
+  // (в теле и заголовке X-Goog-Visitor-Id). Без него часть мутирующих
+  // эндпоинтов (например /feedback — «Скрыть») принимает запрос с кодом 200,
+  // но не применяет действие — токен привязан к visitor-сессии, в которой был
+  // выдан.
+  const visitor = html.match(/"VISITOR_DATA":"([^"]+)"/)?.[1] || null;
   if (!key || !ver) throw new Error('Не удалось получить конфигурацию YouTube (вы залогинены?)');
-  cachedCfg = { key, ver, at: Date.now() };
+  cachedCfg = { key, ver, visitor, at: Date.now() };
   await chrome.storage.local.set({ itCfg: cachedCfg });
   return cachedCfg;
 }
@@ -46,9 +55,15 @@ async function directApi(endpoint, body) {
     'X-Goog-AuthUser': '0',
   };
   if (auth) headers['Authorization'] = auth;
+  if (cfg.visitor) headers['X-Goog-Visitor-Id'] = cfg.visitor;
 
   const payload = JSON.stringify({
-    context: { client: { clientName: 'WEB', clientVersion: cfg.ver, hl: 'ru', gl: 'RU' } },
+    context: {
+      client: {
+        clientName: 'WEB', clientVersion: cfg.ver, hl: 'ru', gl: 'RU',
+        ...(cfg.visitor ? { visitorData: cfg.visitor } : {}),
+      },
+    },
     ...body,
   });
 
@@ -311,16 +326,26 @@ export function parseLockups(json) {
         kind === 'upcoming'
           ? texts.find((t) => /премьера|запланирован|начн[её]тся|scheduled|premieres/i.test(t)) || null
           : null;
-      // Токен пункта меню «Скрыть» (есть только у элементов нативной ленты) —
-      // с ним видео можно скрыть и на самом YouTube через /feedback
+      // Токен пункта меню «Не интересует» (есть только у элементов нативной
+      // ленты) — с ним видео можно скрыть и на самом YouTube через /feedback.
+      // В том же меню есть и другие пункты с feedbackToken (например
+      // «Не рекомендовать канал», «Пожаловаться») — их токен скрывает не то же
+      // самое, поэтому сверяемся с подписью пункта, а не берём первый попавшийся.
       let fbToken = null;
+      let fbTokenFallback = null;
       for (const mi of collectKey(l, 'listItemViewModel')) {
         const t = collectKey(mi, 'feedbackToken')[0];
-        if (t) {
+        if (!t) continue;
+        if (fbTokenFallback == null) fbTokenFallback = t;
+        const itemTexts = collectKey(mi, 'content').filter((c) => typeof c === 'string');
+        if (itemTexts.some((c) => /не интересует|not interested/i.test(c))) {
           fbToken = t;
           break;
         }
       }
+      // Если подпись пункта не распозналась (другая локаль/вариант вёрстки) —
+      // лучше взять первый найденный токен, чем не пробрасывать скрытие вовсе.
+      if (fbToken == null) fbToken = fbTokenFallback;
       return {
         fbToken,
         id: l.contentId,

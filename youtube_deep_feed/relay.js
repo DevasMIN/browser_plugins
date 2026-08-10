@@ -4,7 +4,7 @@
 
 let cfgCache = null;
 
-/** API-ключ и версия клиента: из инлайн-скриптов страницы или свежего HTML. */
+/** API-ключ, версия клиента и visitorData: из инлайн-скриптов страницы или свежего HTML. */
 async function getCfg() {
   if (cfgCache) return cfgCache;
   let src = '';
@@ -20,8 +20,12 @@ async function getCfg() {
   }
   const key = src.match(/"INNERTUBE_API_KEY":"([^"]+)"/)?.[1];
   const ver = src.match(/"INNERTUBE_CONTEXT_CLIENT_VERSION":"([^"]+)"/)?.[1];
+  // Реальные запросы страницы всегда несут visitorData — без него /feedback
+  // может ответить 200 и ничего не сделать (см. js/innertube.js).
+  const visitor =
+    src.match(/"VISITOR_DATA":"([^"]+)"/)?.[1] || (window.yt?.config_?.VISITOR_DATA ?? null);
   if (!key || !ver) throw new Error('Не найдена конфигурация innertube на странице');
-  cfgCache = { key, ver };
+  cfgCache = { key, ver, visitor };
   return cfgCache;
 }
 
@@ -45,12 +49,18 @@ async function doApi(endpoint, body) {
   const auth = await sapisidHash();
   const headers = { 'Content-Type': 'application/json', 'X-Origin': 'https://www.youtube.com' };
   if (auth) headers['Authorization'] = auth;
+  if (cfg.visitor) headers['X-Goog-Visitor-Id'] = cfg.visitor;
   const r = await fetch(`https://www.youtube.com/youtubei/v1/${endpoint}?key=${cfg.key}&prettyPrint=false`, {
     method: 'POST',
     credentials: 'same-origin',
     headers,
     body: JSON.stringify({
-      context: { client: { clientName: 'WEB', clientVersion: cfg.ver, hl: 'ru', gl: 'RU' } },
+      context: {
+        client: {
+          clientName: 'WEB', clientVersion: cfg.ver, hl: 'ru', gl: 'RU',
+          ...(cfg.visitor ? { visitorData: cfg.visitor } : {}),
+        },
+      },
       ...body,
     }),
   });

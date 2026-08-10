@@ -343,7 +343,13 @@ async function syncFeed() {
   try {
     json = await browse({ browseId: 'FEsubscriptions' });
   } catch (e) {
-    return 0; // лента недоступна — не страшно, основной источник — плейлисты
+    // Лента недоступна — не страшно, основной источник видео — плейлисты
+    // каналов. Но без неё не обновляются fbToken'ы, а значит кнопка «Скрыть»
+    // перестаёт пробрасывать скрытие на сам YouTube — стоит хотя бы отметить
+    // это в статусе, а не молчать.
+    console.warn('Лента подписок YouTube недоступна', e);
+    status(`Не удалось прочитать ленту подписок YouTube (${e.message}) — скрытие видео не будет пробрасываться на сам YouTube, пока это не исправится.`);
+    return 0;
   }
   let prevFeedTs = null;
   for (let page = 0; page < 60; page++) {
@@ -785,15 +791,22 @@ async function hideVideo(v, card) {
 
   // Если видео пришло из нативной ленты — скрываем и на YouTube
   let undoToken = null;
+  let fbOk = false;
   if (v.fbToken) {
     try {
-      undoToken = undoTokenFromFeedback(await sendFeedback(v.fbToken), v.fbToken);
+      const resp = await sendFeedback(v.fbToken);
+      undoToken = undoTokenFromFeedback(resp, v.fbToken);
+      // Раньше «(и на YouTube)» показывалось всегда, если у видео был fbToken,
+      // даже если запрос упал или сервер прислал пустышку — сообщение врало об
+      // успехе. Теперь считаем успехом только осмысленный ответ.
+      fbOk = !!(resp && Object.keys(resp).length);
+      if (!fbOk) console.warn('feedback: пустой ответ на токен', v.id);
     } catch (e) {
-      console.warn('feedback fail', e);
+      console.warn('feedback fail', v.id, e);
     }
   }
 
-  showToast(v.fbToken ? 'Скрыто (и на YouTube)' : 'Скрыто', async () => {
+  showToast(fbOk ? 'Скрыто (и на YouTube)' : 'Скрыто', async () => {
     await removeHidden(v.id);
     if (undoToken) {
       try { await sendFeedback(undoToken); } catch (e) { /* уже локально вернули */ }
