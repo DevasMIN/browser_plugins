@@ -25,7 +25,6 @@ function ensureStyles() {
     }
     .${BTN_CLASS}[data-variant="inline"] {
       padding: 0;
-      margin: 0 6px;
       border-radius: 0;
       background: transparent;
       box-shadow: none;
@@ -112,15 +111,6 @@ async function copyText(text) {
   }
 }
 
-function tryDecodeUrl(url) {
-  try {
-    // decodeURI is safe for full URLs: decodes UTF-8 sequences, keeps reserved chars.
-    return decodeURI(url);
-  } catch {
-    return url;
-  }
-}
-
 function createButton({ postId, variant }) {
   ensureStyles();
   const btn = document.createElement("button");
@@ -150,10 +140,9 @@ function createButton({ postId, variant }) {
         throw new Error(resp?.error || "UNKNOWN_ERROR");
       }
 
-      const urlToCopy = tryDecodeUrl(resp.url);
-      const ok = await copyText(urlToCopy);
-      if (ok) toast(`Ссылка скопирована: ${urlToCopy}`);
-      else toast(`Ссылка: ${urlToCopy}`);
+      const ok = await copyText(resp.url);
+      if (ok) toast(`Ссылка скопирована: ${resp.url}`);
+      else toast(`Ссылка: ${resp.url}`);
     } catch (err) {
       toast(`Ошибка: ${String(err?.message || err)}`);
     } finally {
@@ -237,76 +226,79 @@ function injectFloatingButtonOnPostPage() {
   document.documentElement.appendChild(btn);
 }
 
-function isPostLinkAnchor(a) {
-  try {
-    if (!(a instanceof HTMLAnchorElement)) return false;
-    const u = new URL(a.getAttribute("href") || "", location.href);
-    // Post-level link looks like /post/6264278 (no hash like #comment...).
-    if (!/^\/post\/\d+$/i.test(u.pathname)) return false;
-    if (u.hash) return false;
-    if (u.search) return false;
-    return true;
-  } catch {
-    return false;
+function findPostIdForMedia(media) {
+  // Основной путь: у JoyReactor каждый пост в ленте обёрнут в
+  // <div class="postContainer" id="postContainer<ID>">, независимо от того,
+  // видео это или картинка. Ссылка на /post/<id> при этом может лежать в
+  // соседней ветке разметки (шапка поста), а не рядом с самим медиа —
+  // поэтому искать её только вокруг media (как раньше) не всегда работает,
+  // особенно для видео-постов (video обёрнут в div.image без ссылки внутри).
+  const postRoot = media.closest('[id^="postContainer"]');
+  if (postRoot) {
+    const m = postRoot.id.match(/^postContainer(\d+)$/);
+    if (m) return m[1];
   }
+
+  // Запасной путь (старая эвристика) — на случай другой разметки/страницы.
+  const container = media.closest("a") || media.closest("div") || media.parentElement;
+  if (!container) return null;
+  const nearLink =
+    (postRoot || container).querySelector?.("a[href*='/post/']") ||
+    container.closest("a[href*='/post/']") ||
+    media.closest("div")?.querySelector?.("a[href*='/post/']");
+  return nearLink?.getAttribute ? extractPostIdFromUrl(nearLink.getAttribute("href") || "") : null;
 }
 
-function injectButtonsInFeed() {
-  // In feed pages, prefer inserting an inline "mp4" link next to each post-level "ссылка".
-  // This avoids overlay artifacts on comments/avatars.
-  const anchors = Array.from(document.querySelectorAll("a")).filter((a) => {
-    const t = (a.textContent || "").trim().toLowerCase();
-    if (t !== "ссылка") return false;
-    return isPostLinkAnchor(a);
-  });
+function enhanceFeedMedia() {
+  // Try to place a small MP4 button on media blocks in the feed.
+  // Ищем только внутри div.image — это обёртка именно медиа поста (картинки
+  // и видео), а не всего document: без этого ограничения в выборку попадали
+  // также аватарки в комментариях и прочий UI (они тоже лежат внутри общего
+  // postContainer поста, но вне div.image).
+  const mediaNodes = Array.from(document.querySelectorAll("div.image img, div.image video"));
+  for (const media of mediaNodes) {
+    if (!(media instanceof HTMLElement)) continue;
+    if (media.dataset.jrMp4Enhanced === "1") continue;
 
-  for (const a of anchors) {
-    if (a.dataset.jrMp4Done === "1") continue;
-    const postId = extractPostIdFromUrl(a.href);
+    const postId = findPostIdForMedia(media);
     if (!postId) continue;
 
-    // Avoid double insert if already present right after the link.
-    const next = a.nextSibling;
-    if (
-      next &&
-      next.nodeType === Node.ELEMENT_NODE &&
-      /** @type {Element} */ (next).classList?.contains(BTN_CLASS)
-    ) {
-      a.dataset.jrMp4Done = "1";
+    // Create mini overlay button near media. div.image — общая обёртка и для
+    // картинок, и для видео с реальными размерами блока; родитель video
+    // (span.video_holder) — inline и почти нулевой высоты, оверлей в нём
+    // ляжет криво.
+    const wrapper = media.closest("div.image") || media.parentElement;
+    if (!wrapper) continue;
+
+    // Ensure wrapper can host absolutely-positioned overlay
+    const computed = window.getComputedStyle(wrapper);
+    if (computed.position === "static") wrapper.style.position = "relative";
+
+    if (wrapper.querySelector(`.${BTN_CLASS}[data-post-id='${postId}']`)) {
+      media.dataset.jrMp4Enhanced = "1";
       continue;
     }
 
-    const btn = createButton({ postId, variant: "inline" });
+    const btn = createButton({ postId, variant: "mini" });
     btn.dataset.postId = postId;
-    btn.dataset.inline = "1";
+    btn.style.position = "absolute";
+    btn.style.left = "8px";
+    btn.style.top = "8px";
+    btn.style.zIndex = "10";
 
-    // Insert after "ссылка"
-    a.insertAdjacentText("afterend", " ");
-    a.insertAdjacentElement("afterend", btn);
-    a.insertAdjacentText("afterend", " ");
-
-    a.dataset.jrMp4Done = "1";
+    wrapper.appendChild(btn);
+    media.dataset.jrMp4Enhanced = "1";
   }
-}
-
-function isPostPage() {
-  return /^\/post\/\d+$/i.test(location.pathname);
 }
 
 function init() {
-  if (isPostPage()) {
-    injectFloatingButtonOnPostPage();
-  } else {
-    injectButtonsInFeed();
-  }
+  injectFloatingButtonOnPostPage();
+  enhanceFeedMedia();
 
   // Re-scan on dynamic updates
   const mo = new MutationObserver(() => {
-    if (isPostPage()) {
-      injectFloatingButtonOnPostPage();
-    } else {
-      injectButtonsInFeed();
-    }
+    injectFloatingButtonOnPostPage();
+    enhanceFeedMedia();
   });
   mo.observe(document.documentElement, { childList: true, subtree: true });
 }

@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "__MSG_extName__",
-  "version": "1.0",
+  "version": "1.1",
   "description": "__MSG_extDescription__",
   "default_locale": "ru",
-  "host_permissions": ["https://joy.reactor.cc/*", "*://joyreactor.cc/*", "*://*.joyreactor.cc/*"],
+  "host_permissions": ["https://joy.reactor.cc/*", "*://joyreactor.cc/*", "*://*.joyreactor.cc/*", "*://reactor.cc/*", "*://*.reactor.cc/*"],
   "background": {
     "service_worker": "background.js"
   },
@@ -19,7 +19,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://joy.reactor.cc/*"],
+      "matches": ["https://joy.reactor.cc/*", "*://joyreactor.cc/*", "*://*.joyreactor.cc/*"],
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": false

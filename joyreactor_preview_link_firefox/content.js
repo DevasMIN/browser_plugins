@@ -226,31 +226,48 @@ function injectFloatingButtonOnPostPage() {
   document.documentElement.appendChild(btn);
 }
 
+function findPostIdForMedia(media) {
+  // Основной путь: у JoyReactor каждый пост в ленте обёрнут в
+  // <div class="postContainer" id="postContainer<ID>">, независимо от того,
+  // видео это или картинка. Ссылка на /post/<id> при этом может лежать в
+  // соседней ветке разметки (шапка поста), а не рядом с самим медиа —
+  // поэтому искать её только вокруг media (как раньше) не всегда работает,
+  // особенно для видео-постов (video обёрнут в div.image без ссылки внутри).
+  const postRoot = media.closest('[id^="postContainer"]');
+  if (postRoot) {
+    const m = postRoot.id.match(/^postContainer(\d+)$/);
+    if (m) return m[1];
+  }
+
+  // Запасной путь (старая эвристика) — на случай другой разметки/страницы.
+  const container = media.closest("a") || media.closest("div") || media.parentElement;
+  if (!container) return null;
+  const nearLink =
+    (postRoot || container).querySelector?.("a[href*='/post/']") ||
+    container.closest("a[href*='/post/']") ||
+    media.closest("div")?.querySelector?.("a[href*='/post/']");
+  return nearLink?.getAttribute ? extractPostIdFromUrl(nearLink.getAttribute("href") || "") : null;
+}
+
 function enhanceFeedMedia() {
   // Try to place a small MP4 button on media blocks in the feed.
-  // We don't rely on exact JoyReactor markup: detect images/videos and find nearest /post/<id> link.
-  const mediaNodes = Array.from(document.querySelectorAll("img, video"));
+  // Ищем только внутри div.image — это обёртка именно медиа поста (картинки
+  // и видео), а не всего document: без этого ограничения в выборку попадали
+  // также аватарки в комментариях и прочий UI (они тоже лежат внутри общего
+  // postContainer поста, но вне div.image).
+  const mediaNodes = Array.from(document.querySelectorAll("div.image img, div.image video"));
   for (const media of mediaNodes) {
     if (!(media instanceof HTMLElement)) continue;
     if (media.dataset.jrMp4Enhanced === "1") continue;
 
-    const container = media.closest("a") || media.closest("div") || media.parentElement;
-    if (!container) continue;
-
-    // Find post id nearby
-    let postId = null;
-    const nearLink =
-      container.closest("a[href*='/post/']") ||
-      container.querySelector?.("a[href*='/post/']") ||
-      media.closest("div")?.querySelector?.("a[href*='/post/']");
-
-    if (nearLink && nearLink.getAttribute) {
-      postId = extractPostIdFromUrl(nearLink.getAttribute("href") || "");
-    }
+    const postId = findPostIdForMedia(media);
     if (!postId) continue;
 
-    // Create mini overlay button near media
-    const wrapper = media.parentElement;
+    // Create mini overlay button near media. div.image — общая обёртка и для
+    // картинок, и для видео с реальными размерами блока; родитель video
+    // (span.video_holder) — inline и почти нулевой высоты, оверлей в нём
+    // ляжет криво.
+    const wrapper = media.closest("div.image") || media.parentElement;
     if (!wrapper) continue;
 
     // Ensure wrapper can host absolutely-positioned overlay
