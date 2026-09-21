@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Deep Feed — подписки</title>
+  <link rel="stylesheet" href="feed.css">
+</head>
+<body>
+  <header id="topbar">
+    <h1>Deep Feed</h1>
+    <span id="stats"></span>
+    <div class="spacer"></div>
+    <span class="searchWrap">
+      <input id="search" type="search" placeholder="Поиск по названию…">
+      <button id="searchClear" class="clearBtn" type="button" title="Очистить поиск" hidden>✕</button>
+    </span>
+    <select id="channelFilter">
+      <option value="">Все каналы</option>
+    </select>
+    <button id="btnSortDir" title="Переключить порядок сортировки ленты по дате публикации">↓ новые→старые</button>
+    <label class="toggle"><input type="checkbox" id="hideWatched" checked> скрывать просмотренные</label>
+    <label class="toggle"><input type="checkbox" id="hideHidden" checked> скрывать скрытые</label>
+    <button id="btnSync" title="Подписки, новые видео и полная индексация/проверка новых видео">Синхронизация</button>
+    <button id="btnYoutube" title="Открыть ленту подписок на youtube.com в новой вкладке">YouTube</button>
+    <button id="btnChannels">Каналы</button>
+    <button id="btnExport" title="Сохранить все настройки и базу в файл (резервная копия / перенос)">Экспорт</button>
+    <button id="btnImport" title="Загрузить настройки и базу из файла">Импорт</button>
+    <input id="importFile" type="file" accept="application/json,.json" hidden>
+    <button id="btnAbort" class="danger" hidden>Стоп</button>
+  </header>
+
+  <div id="status" hidden>
+    <div id="statusText"></div>
+    <progress id="statusBar" max="100" value="0"></progress>
+  </div>
+
+  <section id="welcome" hidden>
+    <h2>Первый запуск</h2>
+    <p>Плагин соберёт собственную хронологическую ленту по всем вашим подпискам YouTube.</p>
+    <p>Список подписок, полная индексация архива каждого канала (может занять
+      время на канал с большой историей) и импорт отметок «просмотрено» из
+      истории YouTube — всё одним нажатием. Дальше синхронизация быстрая:
+      только проверка новых видео.</p>
+    <button id="btnStart">Начать первичную синхронизацию</button>
+  </section>
+
+  <aside id="channelPanel" hidden>
+    <header>
+      <h2>Каналы</h2>
+      <span class="searchWrap">
+        <input id="channelSearch" type="search" placeholder="Найти канал…">
+        <button id="channelSearchClear" class="clearBtn" type="button" title="Очистить поиск" hidden>✕</button>
+      </span>
+      <button id="btnCloseChannels">✕</button>
+    </header>
+    <div class="chGlobalActions">
+      <button id="btnResetAllWatched" title="Сбросить отметки «просмотрено» для ВСЕХ каналов — полностью или начиная с даты">↺ просмотренное (все каналы)</button>
+      <button id="btnUnhideAll" title="Вернуть все скрытые видео, кроме лежащих в «Смотреть позже»">↩ вернуть все скрытые</button>
+    </div>
+    <div id="channelList"></div>
+  </aside>
+
+  <button id="btnFresh" hidden>↑ новые</button>
+
+  <main id="feed"></main>
+  <div id="sentinel"></div>
+  <div id="feedEnd" hidden>— конец ленты —</div>
+
+  <div id="toast" hidden><span id="toastText"></span><button id="toastUndo">Отменить</button></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

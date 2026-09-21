@@ -1,0 +1,1469 @@
+// Deep Feed: логика синхронизации и интерфейс ленты.
+
+// Полифил для совместимости Firefox и Chrome
+const browserAPI = typeof browser !== 'undefined' ? browser : chrome;
+
+import {
+  browse, sendFeedback, addToWatchLater, removeFromWatchLater, fetchWatchLaterIds,
+  collectKey, sleep, findToken, normThumbUrl,
+  parseChannels, parseLockups, parseHistory, parseRelativeDate, canonicalPubTs,
+  pubTsRange, fmtRelative,
+} from './innertube.js';
+import * as db from './db.js';
+
+/** Просмотренным считаем видео с прогрессом от этого процента. */
+const WATCHED_PCT = 90;
+/**
+ * Максимум страниц полной индексации канала за один заход. Пока канал не
+ * проиндексирован полностью (ch.backfillDone), докачиваем историю без оглядки
+ * на запас непросмотренных — прогресс (ch.nextToken) переживает прерывания и
+ * продолжается со следующей синхронизации.
+ */
+const FULL_INDEX_MAX_PAGES = 40;
+/**
+ * Максимум страниц докачки для уже проиндексированного канала: обычно хватает
+ * первой страницы, но если с прошлой синхронизации вышло видео больше, чем
+ * помещается на одну страницу, докачиваем ещё, пока страницы целиком новые.
+ */
+const CATCHUP_MAX_PAGES = 8;
+/** Пауза между запросами к YouTube, чтобы не злить антиспам. */
+const REQUEST_DELAY = 350;
+/** Сколько карточек добавляется за одну порцию скролла. */
+const PAGE_SIZE = 60;
+/** Импорт истории останавливается после стольких подряд уже известных отметок. */
+const HISTORY_KNOWN_STOP = 300;
+/**
+ * Максимум страниц истории за один заход (~100 отметок/стр). На первом запуске
+ * условие «уже известных» не срабатывает, иначе история листалась бы за все годы.
+ * Возобновляемо: кнопка «История» продолжит с сохранённого места.
+ */
+const HISTORY_MAX_PAGES = 40;
+
+const idHash = (s) => {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+};
+
+/**
+ * Метка времени из каноничной даты: внутри одной «корзины» («8 месяцев назад»)
+ * видео детерминированно расталкиваются по id, иначе лента группируется
+ * блоками по каналам — они синхронизируются по очереди.
+ */
+const stableTs = (canon, id) =>
+  canon.ts - (idHash(id) % Math.max(1000, Math.floor(canon.g / 2)));
+
+const state = {
+  channels: new Map(),   // id -> запись канала
+  watched: new Map(),    // videoId -> pct
+  hidden: new Set(),     // videoId (скрытые: вручную, из ленты, WL и т.п.)
+  hiddenSync: new Set(), // подмножество hidden, которое синхронизируем между устройствами
+  wl: new Set(),         // videoId в плейлисте «Смотреть позже»
+  filters: { hideWatched: true, hideHidden: true, search: '', channel: '', sortDir: 'desc' },
+  cursor: null,
+  feedDone: false,
+  loadingPage: false,
+  syncing: false,
+  abort: false,
+  pendingNew: 0,
+};
+
+/**
+ * Источники скрытия, которые синхронизируются между устройствами через
+ * browserAPI.storage.sync. feed-diff НЕ синхронизируем — он заново вычисляется
+ * из нативной ленты на каждом устройстве и раздул бы квоту sync.
+ */
+const SYNCABLE_HIDE_SRC = new Set(['manual', 'yt-feedback', 'wl']);
+/** Префикс и размер чанков зеркала скрытого в browserAPI.storage.sync. */
+const SYNC_KEY_PREFIX = 'dfh_';
+const SYNC_CHUNK_CHARS = 7000;
+
+/** Лёгкая автопроверка новых видео (нативная лента), пока страница открыта. */
+const AUTO_FEED_INTERVAL = 15 * 60e3;
+/** Полный обход каналов — не чаще, чем раз в столько. */
+const FULL_SYNC_INTERVAL = 6 * 3600e3;
+
+const $ = (id) => document.getElementById(id);
+
+// ---------- Прогресс/статус ----------
+
+function status(text, pct = null) {
+  $('status').hidden = !text;
+  $('statusText').textContent = text || '';
+  $('statusBar').hidden = pct == null;
+  if (pct != null) $('statusBar').value = pct;
+}
+
+function setSyncing(on) {
+  state.syncing = on;
+  state.abort = false;
+  for (const id of ['btnSync', 'btnStart']) {
+    const b = $(id);
+    if (b) b.disabled = on;
+  }
+  $('btnAbort').hidden = !on;
+  if (!on) status('');
+}
+
+function checkAbort() {
+  if (state.abort) throw new Error('aborted');
+}
+
+// ---------- Скрытое: хранение + синхронизация между устройствами ----------
+
+let syncPushTimer = null;
+
+/** Добавляет видео в скрытые (локально + IndexedDB + при необходимости в sync). */
+async function addHidden(id, src) {
+  const first = !state.hidden.has(id);
+  state.hidden.add(id);
+  await db.put('hidden', { id, at: Date.now(), src });
+  await db.del('thumbs', id); // скрытое видео больше не покажется — кэш превью не нужен
+  if (SYNCABLE_HIDE_SRC.has(src) && !state.hiddenSync.has(id)) {
+    state.hiddenSync.add(id);
+    scheduleHiddenPush();
+  }
+  return first;
+}
+
+/** Убирает видео из скрытых (для отмены). */
+async function removeHidden(id) {
+  state.hidden.delete(id);
+  await db.del('hidden', id);
+  if (state.hiddenSync.delete(id)) scheduleHiddenPush();
+}
+
+function scheduleHiddenPush() {
+  if (!(browserAPI.storage && browserAPI.storage.sync)) return;
+  clearTimeout(syncPushTimer);
+  syncPushTimer = setTimeout(pushHiddenSync, 1500);
+}
+
+/**
+ * Выкладывает syncable-скрытое в browserAPI.storage.sync (общий для всех устройств,
+ * где включена синхронизация браузера). Пишем чанками: у sync жёсткие лимиты
+ * (100 КБ всего, 8 КБ на элемент). Перед записью подтягиваем чужие правки,
+ * чтобы одновременная запись с двух устройств не затирала друг друга.
+ */
+async function pushHiddenSync() {
+  if (!(browserAPI.storage && browserAPI.storage.sync)) return;
+  await pullHiddenSync();
+  const ids = [...state.hiddenSync];
+  const chunks = [];
+  let cur = '';
+  for (const id of ids) {
+    if (cur.length + id.length + 1 > SYNC_CHUNK_CHARS) {
+      chunks.push(cur);
+      cur = '';
+    }
+    cur += (cur ? ',' : '') + id;
+  }
+  if (cur) chunks.push(cur);
+
+  const toSet = {};
+  chunks.forEach((c, i) => { toSet[SYNC_KEY_PREFIX + i] = c; });
+  try {
+    const all = await browserAPI.storage.sync.get(null);
+    const stale = Object.keys(all).filter((k) => k.startsWith(SYNC_KEY_PREFIX) && !(k in toSet));
+    if (stale.length) await browserAPI.storage.sync.remove(stale);
+    await browserAPI.storage.sync.set(toSet);
+  } catch (e) {
+    console.warn('sync push fail', e);
+    status(`Синхронизация скрытого: не поместилось (${e.message})`);
+  }
+}
+
+/** Подтягивает скрытое с других устройств (только добавление). Возвращает новые id. */
+async function pullHiddenSync() {
+  const added = [];
+  if (!(browserAPI.storage && browserAPI.storage.sync)) return added;
+  let all;
+  try {
+    all = await browserAPI.storage.sync.get(null);
+  } catch (e) {
+    return added;
+  }
+  for (const k of Object.keys(all)) {
+    if (!k.startsWith(SYNC_KEY_PREFIX) || typeof all[k] !== 'string') continue;
+    for (const id of all[k].split(',')) {
+      if (!id) continue;
+      state.hiddenSync.add(id);
+      if (!state.hidden.has(id)) {
+        state.hidden.add(id);
+        await db.put('hidden', { id, at: Date.now(), src: 'sync' });
+        added.push(id);
+      }
+    }
+  }
+  return added;
+}
+
+// ---------- «Смотреть позже» ----------
+
+/** Обновляет локальный список WL с YouTube (сервер общий для всех устройств). */
+async function refreshWatchLater() {
+  try {
+    const ids = await fetchWatchLaterIds();
+    state.wl = ids;
+    await db.metaSet('wl', [...ids]);
+  } catch (e) {
+    console.warn('WL fetch fail', e);
+  }
+}
+
+// ---------- Синхронизация ----------
+
+/** Удаляет канал и все его видео из базы (после отписки). */
+async function removeChannel(chId) {
+  const vids = await db.getAllByIndex('videos', 'ch', chId);
+  for (const v of vids) {
+    await db.del('videos', v.id);
+    await db.del('thumbs', v.id);
+    state.hidden.delete(v.id);
+  }
+  state.channels.delete(chId);
+  await db.del('channels', chId);
+}
+
+/** Список подписок: FEchannels + продолжения. */
+async function syncChannels() {
+  status('Читаю список подписок…');
+  let json = await browse({ browseId: 'FEchannels' });
+  const found = [];
+  let complete = false;
+  for (let page = 0; page < 30; page++) {
+    checkAbort();
+    found.push(...parseChannels(json));
+    const token = findToken(json);
+    if (!token) { complete = true; break; }
+    await sleep(REQUEST_DELAY);
+    json = await browse({ continuation: token });
+  }
+  let added = 0;
+  for (const ch of found) {
+    const old = state.channels.get(ch.id);
+    const row = old
+      ? { ...old, title: ch.title, thumb: ch.thumb }
+      : {
+          ...ch, enabled: 1, hiddenChannel: 0, backfillDone: 0,
+          nextToken: null, plKind: null, lastSync: 0, videoCount: 0,
+        };
+    if (!old) added++;
+    state.channels.set(ch.id, row);
+  }
+  await db.bulkPut('channels', [...state.channels.values()]);
+
+  // Отписки: канал есть в базе, но его больше нет в списке подписок. Удаляем
+  // его и его видео — иначе они продолжают висеть в ленте. Только если список
+  // подписок дочитан полностью (иначе оборванная выдача снесла бы полбазы).
+  let removed = 0;
+  if (complete) {
+    const subscribedIds = new Set(found.map((c) => c.id));
+    for (const chId of [...state.channels.keys()]) {
+      if (!subscribedIds.has(chId)) {
+        await removeChannel(chId);
+        removed++;
+      }
+    }
+  }
+  status(`Подписок: ${found.length} (новых: ${added}${removed ? `, убрано отписанных: ${removed}` : ''})`);
+  return found.length;
+}
+
+/**
+ * Одна страница плейлиста загрузок канала.
+ * Пробуем UULF (без Shorts), при пустоте падаем на UU (все загрузки).
+ */
+async function fetchUploadsPage(ch, token = null) {
+  if (token) {
+    const json = await browse({ continuation: token });
+    return { json, plKind: ch.plKind };
+  }
+  const kinds = ch.plKind ? [ch.plKind] : ['UULF', 'UU'];
+  for (const kind of kinds) {
+    const json = await browse({ browseId: 'VL' + kind + ch.id.slice(2) });
+    if (parseLockups(json).length || kinds.length === 1) return { json, plKind: kind };
+    await sleep(REQUEST_DELAY);
+  }
+  return { json: null, plKind: null };
+}
+
+/** Обновляет отметку просмотра, если новый процент больше сохранённого. */
+async function noteWatched(id, percent, src) {
+  if (percent == null) return;
+  const old = state.watched.get(id) ?? -1;
+  if (percent > old) {
+    state.watched.set(id, percent);
+    await db.put('watched', { id, pct: percent, src, at: Date.now() });
+  }
+}
+
+/** Сохраняет порцию видео канала; возвращает сколько было новых. */
+async function storeVideos(ch, lockups) {
+  const now = Date.now();
+  const rows = [];
+  let prevTs = null;
+  let added = 0;
+  for (const v of lockups) {
+    const existing = await db.get('videos', v.id);
+    const canon = canonicalPubTs(v.pubText, now);
+    let ts = existing?.ts ?? null;
+    if (ts == null) {
+      // Дата не распарсилась — держим порядок плейлиста, вставая чуть раньше соседа
+      ts = canon ? stableTs(canon, v.id) : (prevTs != null ? prevTs - 1000 : now);
+      // Плейлист идёт от новых к старым: внутри одной «корзины» дат сохраняем
+      // его порядок цепочкой −1с. Только внутри корзины: раньше цепочка тянулась
+      // от любого соседа и утаскивала свежее видео к метке сильно старшего.
+      if (canon && prevTs != null && ts >= prevTs && prevTs > canon.ts - canon.g) {
+        ts = prevTs - 1000;
+      }
+    }
+    prevTs = ts;
+    if (!existing) added++;
+    rows.push({
+      id: v.id, ch: ch.id, title: v.title, dur: v.dur, views: v.views,
+      pubText: v.pubText, ts, addedAt: existing?.addedAt ?? now,
+      // Тип (эфир/запланировано) берём из свежего парсинга: эфир заканчивается,
+      // премьера выходит — статус должен обновляться при каждой синхронизации
+      kind: v.kind ?? null, schedText: v.schedText ?? null,
+      // Токен «Скрыть» бывает и у элементов плейлиста загрузок — берём свежий,
+      // если он есть, иначе не теряем ранее найденный (например, из ленты)
+      fbToken: v.fbToken || existing?.fbToken || null,
+    });
+    await noteWatched(v.id, v.percent, 'playlist');
+  }
+  await db.bulkPut('videos', rows);
+  return added;
+}
+
+/**
+ * Синхронизация с нативной лентой подписок YouTube (FEsubscriptions).
+ * Даёт два бонуса, которых нет у плейлистов:
+ * 1) свежие отметки прогресса просмотра;
+ * 2) вычисление скрытых: видео, которое по дате попадает в окно ленты,
+ *    но в ленте отсутствует, — скрыто кнопкой «Скрыть» на YouTube.
+ *    (Сама метка «скрыто» через API не читается — она есть только косвенно.)
+ * Дифф включается, только если лента выглядит здоровой (после массовых
+ * изменений подписок YouTube пересобирает её и какое-то время отдаёт пустоту).
+ */
+async function syncFeed() {
+  status('Читаю ленту подписок YouTube…');
+  await refreshWatchLater();
+  const now = Date.now();
+  const feedIds = new Set();
+  let minTs = Infinity;
+  let newCount = 0;
+  let json;
+  try {
+    json = await browse({ browseId: 'FEsubscriptions' });
+  } catch (e) {
+    // Лента недоступна — не страшно, основной источник видео — плейлисты
+    // каналов. Но без неё не обновляются fbToken'ы, а значит кнопка «Скрыть»
+    // перестаёт пробрасывать скрытие на сам YouTube — стоит хотя бы отметить
+    // это в статусе, а не молчать.
+    console.warn('Лента подписок YouTube недоступна', e);
+    status(`Не удалось прочитать ленту подписок YouTube (${e.message}) — скрытие видео не будет пробрасываться на сам YouTube, пока это не исправится.`);
+    return 0;
+  }
+  let prevFeedTs = null;
+  for (let page = 0; page < 60; page++) {
+    checkAbort();
+    const rows = [];
+    for (const v of parseLockups(json)) {
+      feedIds.add(v.id);
+      const ts0 = parseRelativeDate(v.pubText, now);
+      if (ts0 != null && ts0 < minTs) minTs = ts0;
+      if (v.chId && state.channels.has(v.chId)) {
+        const existing = await db.get('videos', v.id);
+        if (!existing) newCount++;
+        const canon = canonicalPubTs(v.pubText, now);
+        let ts = existing?.ts ?? null;
+        // Самолечение: в ленте подпись всегда свежая, поэтому она — надёжный
+        // ориентир. Если сохранённая метка не попадает в интервал, который
+        // задаёт подпись, значит она испорчена (раньше свежему видео могла
+        // достаться метка соседа) — считаем заново. Метку внутри интервала не
+        // трогаем: она точнее, её ставили по более мелкой единице времени.
+        const range = pubTsRange(v.pubText, now);
+        if (ts != null && range && (ts <= range.lo || ts > range.hi)) ts = null;
+        // Эфиры и премьеры дату не показывают, интервалом их не проверить. Но
+        // метка без даты ставится моментом появления в базе, поэтому «датировано
+        // заметно раньше, чем добавлено» бывает только у доставшейся от соседа.
+        if (ts != null && !range && existing && ts < existing.addedAt - 3600e3) ts = null;
+        if (ts == null) {
+          // Без даты (эфиры, премьеры) — видео из ленты всегда актуальное
+          ts = canon ? stableTs(canon, v.id) : now;
+          // Лента идёт от новых к старым: внутри одной «корзины» дат сохраняем
+          // её порядок цепочкой −1с (только внутри корзины, см. storeVideos)
+          if (canon && prevFeedTs != null && ts >= prevFeedTs && prevFeedTs > canon.ts - canon.g) {
+            ts = prevFeedTs - 1000;
+          }
+        }
+        prevFeedTs = ts;
+        rows.push({
+          id: v.id, ch: v.chId, title: v.title, dur: v.dur, views: v.views,
+          pubText: v.pubText, ts, addedAt: existing?.addedAt ?? now,
+          kind: v.kind ?? null, schedText: v.schedText ?? null,
+          fbToken: v.fbToken || existing?.fbToken || null,
+        });
+      }
+      await noteWatched(v.id, v.percent, 'feed');
+    }
+    await db.bulkPut('videos', rows);
+    status(`Лента YouTube: получено ${feedIds.size} видео…`);
+    const token = findToken(json);
+    if (!token) break;
+    await sleep(REQUEST_DELAY);
+    json = await browse({ continuation: token });
+  }
+
+  // Дифф скрытых: внутри фактического окна ленты (от самого старого её видео),
+  // с отступами от краёв. Старый край: дата «N дней назад» имеет точность в день,
+  // видео чуть старше края могло просто не попасть в окно. Свежий край: новое
+  // видео появляется в ленте с небольшим лагом — 12 часов запаса хватает.
+  const windowDays = (now - minTs) / 86400e3;
+  if (feedIds.size < 20 || windowDays < 2) {
+    status(
+      `Лента YouTube отдала всего ${feedIds.size} видео за последние ${windowDays.toFixed(1)} дн. — `
+      + `слишком мало, чтобы надёжно понять, какие видео вы скрыли на самом YouTube `
+      + `(нужно ≥20 видео и охват ≥2 дней), сверка скрытых пропущена.`
+    );
+    return newCount;
+  }
+  const oldEdge = minTs + 86400e3;
+  const newEdge = now - 12 * 3600e3;
+  const rows = [];
+  let inWindow = 0;
+  for (const v of await db.getAll('videos')) {
+    if (v.ts <= oldEdge || v.ts >= newEdge) continue;
+    const ch = state.channels.get(v.ch);
+    if (!ch || ch.hiddenChannel || !ch.enabled) continue;
+    inWindow++;
+    if (feedIds.has(v.id) || state.hidden.has(v.id)) continue;
+    rows.push({ id: v.id, at: now, src: 'feed-diff' });
+  }
+
+  // Предохранитель. Дифф исходит из того, что нативная лента внутри окна полна:
+  // всё, чего в ней нет, — скрыто пользователем. Но YouTube регулярно отдаёт
+  // ленту урезанной (обрыв пагинации, пересборка после правки подписок), и тогда
+  // «скрытым» окажется почти всё окно разом. Отличить одно от другого можно
+  // только по доле: скрыть половину собственных подписок — не норма.
+  const share = inWindow ? rows.length / inWindow : 0;
+  if (share > 0.5) {
+    status(
+      `Лента YouTube выглядит неполной: в окне ${windowDays.toFixed(1)} дн. у неё ${feedIds.size} видео `
+      + `против ${inWindow} в базе (${Math.round(share * 100)}% пришлось бы пометить скрытыми). `
+      + `Сверка скрытых пропущена, чтобы не вычистить ленту.`
+    );
+    return newCount;
+  }
+
+  for (const r of rows) state.hidden.add(r.id);
+  await db.bulkPut('hidden', rows);
+  status(`Лента YouTube: ${feedIds.size} видео, распознано скрытых: ${rows.length}`);
+  return newCount;
+}
+
+/**
+ * Синхронизация канала.
+ * Пока канал не проиндексирован полностью (ch.backfillDone), докачиваем его
+ * историю страница за страницей до конца плейлиста загрузок — без оглядки на
+ * запас непросмотренных, чтобы после первого прохода в базе лежал весь архив
+ * канала. Прогресс (ch.nextToken) переживает прерывания и продолжается со
+ * следующей синхронизации.
+ * Как только канал полностью проиндексирован, дальнейшие синхронизации —
+ * это лишь проверка новых видео: страница 1, и ещё немного вглубь, только
+ * если целая страница подряд состояла из новых видео (значит, вышло больше,
+ * чем помещается на одну страницу).
+ */
+async function syncChannel(ch) {
+  const { json, plKind } = await fetchUploadsPage(ch);
+  if (!json) {
+    ch.backfillDone = 1; // канал без загрузок (топик-каналы и т.п.)
+    return 0;
+  }
+  ch.plKind = plKind;
+  const firstLockups = parseLockups(json);
+  let added = await storeVideos(ch, firstLockups);
+  const page1Token = findToken(json);
+
+  if (ch.backfillDone) {
+    let token = page1Token;
+    let pageLen = firstLockups.length;
+    let pageAdded = added;
+    let pages = 0;
+    while (token && pageLen > 0 && pageAdded === pageLen && pages < CATCHUP_MAX_PAGES) {
+      checkAbort();
+      await sleep(REQUEST_DELAY);
+      try {
+        const cont = await browse({ continuation: token });
+        const lockups = parseLockups(cont);
+        pageLen = lockups.length;
+        pageAdded = await storeVideos(ch, lockups);
+        added += pageAdded;
+        token = findToken(cont);
+        pages++;
+      } catch (e) {
+        if (e.message === 'aborted') throw e;
+        break;
+      }
+    }
+    return added;
+  }
+
+  if (!ch.nextToken) ch.nextToken = page1Token;
+  if (!ch.nextToken) { ch.backfillDone = 1; return added; }
+  if (ch.onlyNew) return added; // «только новые»: старое не докачиваем вовсе
+
+  let pages = 0;
+  let triedFresh = false;
+  while (!ch.backfillDone && pages < FULL_INDEX_MAX_PAGES) {
+    checkAbort();
+    await sleep(REQUEST_DELAY);
+    try {
+      const cont = await browse({ continuation: ch.nextToken });
+      added += await storeVideos(ch, parseLockups(cont));
+      ch.nextToken = findToken(cont);
+      if (!ch.nextToken) ch.backfillDone = 1;
+      pages++;
+    } catch (e) {
+      if (e.message === 'aborted') throw e;
+      // Сохранённый токен мог протухнуть — один раз начинаем заново с 1-й страницы
+      if (!triedFresh && page1Token) {
+        triedFresh = true;
+        ch.nextToken = page1Token;
+      } else {
+        break;
+      }
+    }
+  }
+  return added;
+}
+
+/** Синхронизация всех каналов: новые видео + докачка полной индексации. */
+async function quickSync() {
+  let totalNew = await syncFeed();
+  const list = [...state.channels.values()].filter((c) => c.enabled && !c.hiddenChannel);
+  let done = 0;
+  for (const ch of list) {
+    checkAbort();
+    status(`Синхронизация: ${ch.title} (${done + 1}/${list.length})`, (done / list.length) * 100);
+    try {
+      totalNew += await syncChannel(ch);
+      ch.lastSync = Date.now();
+      await db.put('channels', ch);
+    } catch (e) {
+      if (e.message === 'aborted') throw e;
+      console.warn('sync fail', ch.title, e);
+    }
+    done++;
+    await sleep(REQUEST_DELAY);
+  }
+  await db.metaSet('lastQuickSync', Date.now());
+  status(`Готово: +${totalNew} новых видео`);
+  return totalNew;
+}
+
+/** Импорт отметок «просмотрено» из истории YouTube. Возобновляемый. */
+async function importHistory() {
+  let token = await db.metaGet('historyToken');
+  let json = token ? await browse({ continuation: token }) : await browse({ browseId: 'FEhistory' });
+  let imported = 0;
+  let consecutiveKnown = 0;
+  const now = Date.now();
+  for (let page = 0; page < HISTORY_MAX_PAGES; page++) {
+    checkAbort();
+    for (const h of parseHistory(json)) {
+      const old = state.watched.get(h.id);
+      if (old != null && old >= h.percent) {
+        consecutiveKnown++;
+      } else {
+        consecutiveKnown = 0;
+        state.watched.set(h.id, h.percent);
+        await db.put('watched', { id: h.id, pct: h.percent, src: 'history', at: now });
+        imported++;
+      }
+    }
+    status(`История: импортировано ${imported} отметок (стр. ${page + 1})`);
+    token = findToken(json);
+    if (!token || consecutiveKnown >= HISTORY_KNOWN_STOP) {
+      token = null;
+      break;
+    }
+    await db.metaSet('historyToken', token);
+    await sleep(REQUEST_DELAY);
+    json = await browse({ continuation: token });
+  }
+  await db.metaSet('historyToken', token);
+  status(`История: +${imported} отметок${token ? ' (нажмите «История» ещё раз, чтобы продолжить глубже)' : ' — вся история пройдена'}`);
+}
+
+/**
+ * Обёртка запуска задач синхронизации.
+ * auto=true — фоновый запуск: ленту не перерисовываем из-под прокрутки,
+ * а при новых видео показываем кнопку «↑ N новых» (или обновляем сразу,
+ * если пользователь и так вверху страницы).
+ */
+async function runTask(fn, auto = false) {
+  if (state.syncing) return;
+  setSyncing(true);
+  try {
+    const added = await fn();
+    await refreshStats();
+    if (!auto) {
+      resetFeed();
+    } else if (added > 0) {
+      if (window.scrollY < 200) {
+        resetFeed();
+      } else {
+        state.pendingNew += added;
+        const b = $('btnFresh');
+        b.textContent = `↑ ${state.pendingNew} новых`;
+        b.hidden = false;
+      }
+    }
+  } catch (e) {
+    if (e.message !== 'aborted') {
+      console.error(e);
+      status(`Ошибка: ${e.message}. Проверьте, что вы залогинены на youtube.com в этом браузере.`);
+    }
+  } finally {
+    state.syncing = false;
+    $('btnAbort').hidden = true;
+    for (const id of ['btnSync', 'btnStart']) {
+      const b = $(id);
+      if (b) b.disabled = false;
+    }
+  }
+}
+
+// ---------- Лента ----------
+
+/**
+ * Процент просмотра с учётом «водяного знака» канала: если каналу нажали
+ * «только новые», ВСЁ старше момента нажатия считается просмотренным —
+ * даже видео, которых ещё не было в базе. Явная отметка (в т.ч. «не смотрел»,
+ * pct=0) сильнее водяного знака.
+ */
+function watchedPctOf(v) {
+  const explicit = state.watched.get(v.id);
+  if (explicit != null) return explicit;
+  const ch = state.channels.get(v.ch);
+  if (ch && ch.watchedBefore && v.ts < ch.watchedBefore) return 100;
+  return 0;
+}
+
+function isWatchedVideo(v) {
+  return watchedPctOf(v) >= WATCHED_PCT;
+}
+
+function acceptVideo(v) {
+  if (state.wl.has(v.id)) return false; // уже в «Смотреть позже»
+  if (state.filters.hideHidden && state.hidden.has(v.id)) return false;
+  const ch = state.channels.get(v.ch);
+  if (!ch || ch.hiddenChannel) return false;
+  if (state.filters.channel && v.ch !== state.filters.channel) return false;
+  if (state.filters.hideWatched && isWatchedVideo(v)) return false;
+  if (state.filters.search) {
+    const s = state.filters.search;
+    const chTitle = ch.title.toLowerCase();
+    if (!v.title.toLowerCase().includes(s) && !chTitle.includes(s)) return false;
+  }
+  return true;
+}
+
+/**
+ * Ленивая подгрузка превью с кэшем в IndexedDB (стор 'thumbs'): не дёргаем
+ * i.ytimg.com повторно на каждый показ карточки и можем явно почистить кэш
+ * по видео, когда его скрывают (см. addHidden). Подгрузка всё равно ленивая —
+ * через тот же IntersectionObserver, что и раньше давал native loading="lazy".
+ */
+let liveThumbUrls = [];
+const thumbObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    thumbObserver.unobserve(e.target);
+    loadThumb(e.target.dataset.id, e.target);
+  }
+}, { rootMargin: '600px' });
+
+async function loadThumb(id, img) {
+  const url = `https://i.ytimg.com/vi/${id}/mqdefault.jpg`;
+  try {
+    const cached = await db.get('thumbs', id);
+    let blob = cached && cached.blob;
+    if (!blob) {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('http ' + resp.status);
+      blob = await resp.blob();
+      await db.put('thumbs', { id, blob, at: Date.now() });
+    }
+    const obj = URL.createObjectURL(blob);
+    liveThumbUrls.push(obj);
+    img.src = obj;
+  } catch (e) {
+    img.src = url; // кэш/сеть не сработали — грузим напрямую как раньше
+  }
+}
+
+function makeCard(v) {
+  const ch = state.channels.get(v.ch);
+  const pct = state.watched.get(v.id) ?? 0;
+
+  const card = document.createElement('div');
+  card.className = 'card' + (isWatchedVideo(v) ? ' watched' : '') + (state.hidden.has(v.id) ? ' hiddenmark' : '');
+  card.dataset.id = v.id;
+
+  const thumb = document.createElement('a');
+  thumb.className = 'thumb';
+  thumb.href = `https://www.youtube.com/watch?v=${v.id}`;
+  thumb.target = '_blank';
+  const img = document.createElement('img');
+  img.dataset.id = v.id;
+  thumb.appendChild(img);
+  thumbObserver.observe(img);
+  if (v.dur) {
+    const dur = document.createElement('span');
+    dur.className = 'dur';
+    dur.textContent = v.dur;
+    thumb.appendChild(dur);
+  }
+  if (v.kind) {
+    const kb = document.createElement('span');
+    kb.className = 'kbadge ' + v.kind;
+    kb.textContent =
+      v.kind === 'live' ? 'В ЭФИРЕ' : v.kind === 'upcoming' ? 'ЗАПЛАНИРОВАНО' : 'СТРИМ';
+    thumb.appendChild(kb);
+  }
+  if (pct > 0) {
+    const bar = document.createElement('div');
+    bar.className = 'progress';
+    const fill = document.createElement('div');
+    fill.style.width = `${Math.min(pct, 100)}%`;
+    bar.appendChild(fill);
+    thumb.appendChild(bar);
+  }
+  card.appendChild(thumb);
+
+  const title = document.createElement('a');
+  title.className = 'title';
+  title.href = thumb.href;
+  title.target = '_blank';
+  title.textContent = v.title;
+  card.appendChild(title);
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  // Дата считается из ts — той же величины, по которой лента отсортирована,
+  // поэтому подпись и позиция не могут разойтись. Хранимый pubText для этого
+  // не годится: он замерзает, когда видео перестаёт попадать в синхронизацию.
+  const dateText =
+    v.kind === 'upcoming' && v.schedText ? v.schedText : fmtRelative(v.ts);
+  meta.textContent = `${ch ? ch.title : '?'} • ${dateText}${v.views ? ' • ' + v.views : ''}`;
+  card.appendChild(meta);
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const btnL = document.createElement('button');
+  btnL.textContent = '⏳ позже';
+  btnL.title = v.fbToken
+    ? 'Добавить в «Смотреть позже» на YouTube и скрыть из этой ленты и из ленты YouTube'
+    : 'Добавить в «Смотреть позже» на YouTube и убрать из ленты';
+  btnL.onclick = () => watchLater(v, card, btnL);
+  const btnW = document.createElement('button');
+  btnW.textContent = isWatchedVideo(v) ? '↩ не смотрел' : '✓ просмотрено';
+  btnW.onclick = () => toggleWatched(v, card, btnW);
+  const btnH = document.createElement('button');
+  setHideBtn(btnH, v);
+  btnH.onclick = () => (state.hidden.has(v.id) ? unhideVideo(v, card, btnH) : hideVideo(v, card, btnH));
+  actions.append(btnL, btnW, btnH);
+  card.appendChild(actions);
+
+  return card;
+}
+
+async function markWatched(id, pct, src) {
+  state.watched.set(id, pct);
+  await db.put('watched', { id, pct, src, at: Date.now() });
+}
+
+async function toggleWatched(v, card, btn) {
+  if (isWatchedVideo(v)) {
+    // Явный pct=0 перебивает и старую отметку, и водяной знак «только новые»
+    state.watched.set(v.id, 0);
+    await db.put('watched', { id: v.id, pct: 0, src: 'manual', at: Date.now() });
+    card.classList.remove('watched');
+    btn.textContent = '✓ просмотрено';
+  } else {
+    await markWatched(v.id, 100, 'manual');
+    card.classList.add('watched');
+    btn.textContent = '↩ не смотрел';
+    if (state.filters.hideWatched) card.remove();
+  }
+  refreshStats();
+}
+
+let toastTimer = null;
+
+/** Тост с кнопкой «Отменить». onUndo вызывается при отмене. */
+function showToast(text, onUndo) {
+  const t = $('toast');
+  $('toastText').textContent = text;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  $('toastUndo').onclick = async () => {
+    clearTimeout(toastTimer);
+    t.hidden = true;
+    try {
+      await onUndo();
+    } catch (e) {
+      console.warn('undo fail', e);
+    }
+  };
+  toastTimer = setTimeout(() => { t.hidden = true; }, 8000);
+}
+
+/** Возвращает карточку на её место в ленте (для отмены скрытия). */
+function restoreCard(card, parent, nextCard) {
+  if (!parent || !parent.isConnected) {
+    resetFeed();
+    return;
+  }
+  parent.insertBefore(card, nextCard && nextCard.isConnected ? nextCard : null);
+}
+
+/** Токен отмены из ответа /feedback (обычно это второй feedbackToken). */
+function undoTokenFromFeedback(resp, usedToken) {
+  const toks = collectKey(resp || {}, 'feedbackToken')
+    .filter((t) => typeof t === 'string' && t !== usedToken);
+  return toks[0] || null;
+}
+
+/**
+ * Отправляет «Не интересует» по fbToken видео (если он есть) — тем же путём
+ * пользуются и «✕ скрыть», и «⏳ позже», чтобы не заставлять кликать дважды.
+ * Возвращает {ok, undoToken}: ok=false, если токена нет, запрос упал или
+ * сервер ответил пустышкой (значит реально ничего не скрылось).
+ */
+async function feedbackHide(v) {
+  if (!v.fbToken) return { ok: false, undoToken: null };
+  try {
+    const resp = await sendFeedback(v.fbToken);
+    const undoToken = undoTokenFromFeedback(resp, v.fbToken);
+    const ok = !!(resp && Object.keys(resp).length);
+    if (!ok) console.warn('feedback: пустой ответ на токен', v.id);
+    return { ok, undoToken };
+  } catch (e) {
+    console.warn('feedback fail', v.id, e);
+    return { ok: false, undoToken: null };
+  }
+}
+
+/** Обновляет текст/подсказку кнопки «скрыть» ↔ «вернуть» по текущему состоянию. */
+function setHideBtn(btn, v) {
+  const hidden = state.hidden.has(v.id);
+  btn.textContent = hidden ? '↩ вернуть' : '✕ скрыть';
+  btn.title = hidden
+    ? 'Вернуть видео — перестанет считаться скрытым'
+    : (v.fbToken ? 'Скрыть из этой ленты и из ленты YouTube' : 'Скрыть это видео из ленты');
+}
+
+async function hideVideo(v, card, btn) {
+  const parent = card.parentNode;
+  const nextCard = card.nextSibling;
+  await addHidden(v.id, 'manual');
+
+  // Если видео пришло из нативной ленты — скрываем и на YouTube
+  const { ok: fbOk, undoToken } = await feedbackHide(v);
+
+  // Галочка «скрывать скрытые» может быть снята — тогда карточка остаётся
+  // в ленте (просто помечается), и толкать её тостом с отменой незачем:
+  // вернуть можно прямо той же кнопкой.
+  if (!state.filters.hideHidden) {
+    card.classList.add('hiddenmark');
+    if (btn) setHideBtn(btn, v);
+    return;
+  }
+
+  card.remove();
+  showToast(fbOk ? 'Скрыто (и на YouTube)' : 'Скрыто', async () => {
+    await removeHidden(v.id);
+    if (undoToken) {
+      try { await sendFeedback(undoToken); } catch (e) { /* уже локально вернули */ }
+    }
+    restoreCard(card, parent, nextCard);
+  });
+}
+
+/** Возврат вручную скрытого видео кнопкой на самой карточке (видна, только когда снята «скрывать скрытые»). */
+async function unhideVideo(v, card, btn) {
+  await removeHidden(v.id);
+  card.classList.remove('hiddenmark');
+  if (btn) setHideBtn(btn, v);
+}
+
+async function watchLater(v, card, btn) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  const parent = card.parentNode;
+  const nextCard = card.nextSibling;
+  try {
+    await addToWatchLater(v.id);
+    state.wl.add(v.id);
+    await addHidden(v.id, 'wl');
+    card.remove();
+    // Заодно скрываем и в нативной ленте YouTube — чтобы не кликать отдельно
+    // «✕ скрыть» на то же видео.
+    const { ok: fbOk, undoToken } = await feedbackHide(v);
+    showToast(fbOk ? 'В «Смотреть позже» (и скрыто на YouTube)' : 'В «Смотреть позже»', async () => {
+      try { await removeFromWatchLater(v.id); } catch (e) { /* останется в WL */ }
+      if (undoToken) {
+        try { await sendFeedback(undoToken); } catch (e) { /* уже локально вернули */ }
+      }
+      state.wl.delete(v.id);
+      await removeHidden(v.id);
+      restoreCard(card, parent, nextCard);
+    });
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '⏳ позже';
+    status('Не удалось добавить в «Смотреть позже»: ' + e.message);
+  }
+}
+
+// Поколение ленты: resetFeed его повышает, и результат страницы, начатой до
+// сброса, выбрасывается. Раньше такой «поздний» результат молча блокировал
+// перерисовку (флаг loadingPage), и новые видео появлялись только после F5.
+let feedGen = 0;
+
+async function loadMore() {
+  if (state.loadingPage || state.feedDone) return;
+  state.loadingPage = true;
+  const gen = feedGen;
+  const { items, cursor, done } = await db.pageVideos({
+    cursor: state.cursor,
+    limit: PAGE_SIZE,
+    accept: acceptVideo,
+    dir: state.filters.sortDir,
+  });
+  state.loadingPage = false;
+  if (gen !== feedGen) {
+    loadMore(); // страница устарела (ленту сбросили) — перечитываем свежую
+    return;
+  }
+  state.cursor = cursor;
+  state.feedDone = done;
+  const frag = document.createDocumentFragment();
+  for (const v of items) frag.appendChild(makeCard(v));
+  $('feed').appendChild(frag);
+  $('feedEnd').hidden = !done;
+}
+
+function resetFeed() {
+  feedGen++;
+  thumbObserver.disconnect();
+  for (const u of liveThumbUrls) URL.revokeObjectURL(u);
+  liveThumbUrls = [];
+  state.cursor = null;
+  state.feedDone = false;
+  $('feed').textContent = '';
+  $('feedEnd').hidden = true;
+  loadMore();
+}
+
+async function refreshStats() {
+  // Честный подсчёт по записям базы: сколько видео реально осталось к просмотру
+  // (не скрыто, канал виден, не просмотрено явно или водяным знаком)
+  const all = await db.getAll('videos');
+  let unwatched = 0;
+  for (const v of all) {
+    if (state.hidden.has(v.id)) continue;
+    const ch = state.channels.get(v.ch);
+    if (!ch || ch.hiddenChannel) continue;
+    if (!isWatchedVideo(v)) unwatched++;
+  }
+  $('stats').textContent = `${all.length} видео в базе · ${unwatched} к просмотру`;
+}
+
+// ---------- Панель каналов ----------
+
+/**
+ * Сбрасывает отметки «просмотрено» канала: полностью (cutoffTs=null) или
+ * только для видео, опубликованных начиная с cutoffTs.
+ * Заодно подрезает водяной знак «только новые» (ch.watchedBefore), если он
+ * распространялся дальше cutoffTs — иначе сброшенные видео тут же снова
+ * считались бы просмотренными по водяному знаку.
+ */
+async function resetChannelWatched(ch, cutoffTs) {
+  const vids = await db.getAllByIndex('videos', 'ch', ch.id);
+  let n = 0;
+  for (const v of vids) {
+    if (cutoffTs != null && v.ts < cutoffTs) continue;
+    if (state.watched.has(v.id)) {
+      state.watched.delete(v.id);
+      await db.del('watched', v.id);
+      n++;
+    }
+  }
+  if (ch.watchedBefore) {
+    if (cutoffTs == null) ch.watchedBefore = null;
+    else if (cutoffTs < ch.watchedBefore) ch.watchedBefore = cutoffTs;
+    await db.put('channels', ch);
+  }
+  return n;
+}
+
+/** То же самое, что resetChannelWatched, но сразу для всех каналов. */
+async function resetAllWatched(cutoffTs) {
+  let n = 0;
+  for (const ch of state.channels.values()) {
+    n += await resetChannelWatched(ch, cutoffTs);
+  }
+  return n;
+}
+
+/**
+ * Возвращает все скрытые видео разом, кроме лежащих в «Смотреть позже» —
+ * те скрыты не по ошибке, а потому что уже в WL, и останутся скрытыми, пока
+ * не будут убраны из плейлиста на самом YouTube.
+ */
+async function unhideAll() {
+  const rows = await db.getAll('hidden');
+  let n = 0;
+  for (const r of rows) {
+    if (state.wl.has(r.id)) continue;
+    state.hidden.delete(r.id);
+    await db.del('hidden', r.id);
+    if (state.hiddenSync.delete(r.id)) scheduleHiddenPush();
+    n++;
+  }
+  return n;
+}
+
+async function renderChannelPanel() {
+  const filter = ($('channelSearch').value || '').trim().toLowerCase();
+  const list = [...state.channels.values()]
+    .filter((c) => !filter || c.title.toLowerCase().includes(filter))
+    .sort((a, b) => a.title.localeCompare(b.title, 'ru'));
+  const box = $('channelList');
+  box.textContent = '';
+  for (const ch of list) {
+    const row = document.createElement('div');
+    row.className = 'chRow' + (ch.hiddenChannel ? ' chHidden' : '');
+
+    // Верхняя строка: аватар, название (никогда не обрезается кнопками), счётчик
+    const top = document.createElement('div');
+    top.className = 'chRowTop';
+    const avatar = document.createElement('div');
+    avatar.className = 'chAvatar';
+    avatar.textContent = (ch.title || '?').trim().charAt(0).toUpperCase();
+    const url = normThumbUrl(ch.thumb);
+    if (url) {
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.src = url;
+      img.onload = () => { avatar.textContent = ''; };
+      img.onerror = () => { img.remove(); }; // остаётся буква-заглушка
+      avatar.appendChild(img);
+    }
+    top.appendChild(avatar);
+    const name = document.createElement('span');
+    name.className = 'chName';
+    name.textContent = ch.title;
+    name.title = ch.title;
+    if (ch.onlyNew) name.title += ' — показываются только новые видео';
+    top.appendChild(name);
+    const cnt = document.createElement('span');
+    cnt.className = 'chCount';
+    db.count('videos', 'ch', ch.id).then((n) => {
+      cnt.textContent = `${n}${ch.backfillDone ? '' : '…'}`;
+    });
+    top.appendChild(cnt);
+    row.appendChild(top);
+
+    // Нижняя строка: действия над каналом
+    const actions = document.createElement('div');
+    actions.className = 'chRowActions';
+
+    // Водяной знак «только новые» больше нельзя поставить из интерфейса —
+    // только снять, если он остался от прежней версии.
+    if (ch.onlyNew) {
+      const btnNew = document.createElement('button');
+      btnNew.textContent = '⟲ и старые';
+      btnNew.title = 'Снова докачивать и показывать старые видео канала';
+      btnNew.onclick = async () => {
+        ch.onlyNew = 0;
+        ch.watchedBefore = null;
+        await db.put('channels', ch);
+        renderChannelPanel();
+        resetFeed();
+      };
+      actions.appendChild(btnNew);
+    }
+
+    // Сброс «просмотрено»: весь канал целиком или только начиная с даты
+    const btnReset = document.createElement('button');
+    btnReset.textContent = '↺ сброс';
+    btnReset.title = 'Сбросить отметки «просмотрено» для канала — полностью или начиная с даты';
+    btnReset.onclick = async () => {
+      const input = window.prompt(
+        `Сбросить отметки «просмотрено» для канала «${ch.title}».\n`
+        + 'Оставьте поле пустым, чтобы сбросить всё, или введите дату (ГГГГ-ММ-ДД) — '
+        + 'будут сброшены только видео, опубликованные начиная с неё.',
+        ''
+      );
+      if (input === null) return; // отмена
+      const trimmed = input.trim();
+      let cutoffTs = null;
+      if (trimmed) {
+        const d = new Date(trimmed);
+        if (isNaN(d.getTime())) {
+          status('Не удалось разобрать дату — используйте формат ГГГГ-ММ-ДД');
+          return;
+        }
+        cutoffTs = d.getTime();
+      } else if (!window.confirm(`Сбросить «просмотрено» для ВСЕХ видео канала «${ch.title}»?`)) {
+        return;
+      }
+      const n = await resetChannelWatched(ch, cutoffTs);
+      status(`«${ch.title}»: сброшено отметок «просмотрено» — ${n}`);
+      renderChannelPanel();
+      await refreshStats();
+      resetFeed();
+    };
+    actions.appendChild(btnReset);
+
+    const btn = document.createElement('button');
+    btn.textContent = ch.hiddenChannel ? 'показать' : 'скрыть';
+    btn.onclick = async () => {
+      ch.hiddenChannel = ch.hiddenChannel ? 0 : 1;
+      await db.put('channels', ch);
+      renderChannelPanel();
+      resetFeed();
+    };
+    actions.appendChild(btn);
+    row.appendChild(actions);
+    box.appendChild(row);
+  }
+}
+
+// ---------- Резервная копия / перенос ----------
+
+const BACKUP_STORES = ['channels', 'videos', 'watched', 'hidden', 'meta'];
+
+/** Выгружает всю базу и настройки в JSON-файл. */
+async function exportBackup() {
+  status('Готовлю резервную копию…');
+  const data = {};
+  for (const s of BACKUP_STORES) data[s] = await db.getAll(s);
+  const blob = new Blob([JSON.stringify({ format: 'deepfeed', v: 1, at: Date.now(), data })], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `deepfeed-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  const total = data.videos.length;
+  status(`Экспортировано: ${total} видео, ${data.channels.length} каналов`);
+}
+
+/** Загружает базу из JSON-файла (слияние: существующие записи перезаписываются). */
+async function importBackup(file) {
+  status('Читаю файл…');
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch (e) {
+    status('Не удалось прочитать файл: не JSON');
+    return;
+  }
+  const data = parsed.data || parsed;
+
+  // Останавливаем идущую синхронизацию: она держит каналы в памяти и после
+  // импорта записала бы их поверх импортированных — терялись бы, например,
+  // водяные знаки «только новые»
+  if (state.syncing) {
+    state.abort = true;
+    status('Останавливаю синхронизацию перед импортом…');
+    for (let i = 0; i < 150 && state.syncing; i++) await sleep(200);
+  }
+  let counts = [];
+  for (const s of BACKUP_STORES) {
+    if (Array.isArray(data[s])) {
+      await db.bulkPut(s, data[s]);
+      counts.push(`${s}: ${data[s].length}`);
+    }
+  }
+  status(`Импорт завершён (${counts.join(', ')}). Перезагружаю…`);
+  setTimeout(() => location.reload(), 800);
+}
+
+// ---------- Инициализация ----------
+
+function fillChannelFilter() {
+  const sel = $('channelFilter');
+  while (sel.options.length > 1) sel.remove(1);
+  const list = [...state.channels.values()]
+    .filter((c) => !c.hiddenChannel)
+    .sort((a, b) => a.title.localeCompare(b.title, 'ru'));
+  for (const ch of list) {
+    const opt = document.createElement('option');
+    opt.value = ch.id;
+    opt.textContent = ch.title;
+    sel.appendChild(opt);
+  }
+}
+
+/** Текст кнопки переключения порядка сортировки ленты. */
+function sortDirLabel() {
+  return state.filters.sortDir === 'asc' ? '↑ старые→новые' : '↓ новые→старые';
+}
+
+async function init() {
+  await db.openDb();
+  for (const ch of await db.getAll('channels')) state.channels.set(ch.id, ch);
+  for (const w of await db.getAll('watched')) state.watched.set(w.id, w.pct);
+  for (const h of await db.getAll('hidden')) {
+    state.hidden.add(h.id);
+    if (SYNCABLE_HIDE_SRC.has(h.src) || h.src === 'sync') state.hiddenSync.add(h.id);
+  }
+  state.wl = new Set(await db.metaGet('wl', []));
+
+  /** Каноничная метка видео, посчитанная от момента его попадания в базу. */
+  const canonTs = (v) => {
+    const canon = canonicalPubTs(v.pubText, v.addedAt || Date.now());
+    return canon ? stableTs(canon, v.id) : null;
+  };
+
+  // Одноразовая миграция меток времени (v0.9.10): раньше метка считалась от
+  // момента синхронизации конкретного канала, и внутри одной «корзины» дат
+  // («8 месяцев назад») лента группировалась блоками по каналам. Пересчитываем
+  // в канонические метки; внутри корзины расталкиваем детерминированно по id,
+  // чтобы каналы перемешались.
+  if (!(await db.metaGet('tsCanonical'))) {
+    status('Разовая миграция дат…');
+    const all = await db.getAll('videos');
+    for (const v of all) {
+      const ts = canonTs(v);
+      if (ts != null) v.ts = ts;
+    }
+    await db.bulkPut('videos', all);
+    await db.metaSet('tsCanonical', 1);
+    status('');
+  }
+
+  // Миграция v0.9.16: из-за ASCII-семантики \b в JS регэксп «\bдн» не совпадал
+  // с кириллицей, и даты «2 дня»/«5 дней назад» не парсились вовсе — таким
+  // видео ставилась метка цепочкой от соседа (фактически «почти сейчас»).
+  // Пересчитываем их: без этого лента остаётся с перекошенным порядком, а дифф
+  // скрытых их не видит, потому что они не попадают в окно по дате.
+  if (!(await db.metaGet('tsDaysFix'))) {
+    status('Разовая миграция дат (дни)…');
+    const all = await db.getAll('videos');
+    const fixed = [];
+    for (const v of all) {
+      if (!/дн/i.test(v.pubText || '')) continue;
+      const ts = canonTs(v);
+      if (ts != null && ts !== v.ts) {
+        v.ts = ts;
+        fixed.push(v);
+      }
+    }
+    await db.bulkPut('videos', fixed);
+    await db.metaSet('tsDaysFix', 1);
+    status(fixed.length ? `Пересчитано дат: ${fixed.length}` : '');
+  }
+
+  // Синхронизация скрытого между устройствами (browserAPI.storage.sync)
+  if (browserAPI.storage && browserAPI.storage.sync) {
+    await pullHiddenSync();  // подтянуть с других устройств
+    scheduleHiddenPush();    // выложить локальные, которых там ещё нет
+    browserAPI.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'sync') return;
+      if (!Object.keys(changes).some((k) => k.startsWith(SYNC_KEY_PREFIX))) return;
+      pullHiddenSync().then((added) => {
+        if (!added.length) return;
+        for (const id of added) {
+          const c = $('feed').querySelector(`.card[data-id="${id}"]`);
+          if (c) c.remove();
+        }
+        refreshStats();
+      });
+    });
+  }
+
+  fillChannelFilter();
+  $('btnSortDir').textContent = sortDirLabel();
+  await refreshStats();
+
+  const firstRun = state.channels.size === 0;
+  $('welcome').hidden = !firstRun;
+
+  async function fullSync() {
+    await syncChannels();
+    fillChannelFilter();
+    return quickSync();
+  }
+
+  // Автосинхронизация: лёгкая проверка ленты каждые 15 минут,
+  // полный обход каналов — раз в 6 часов. Работает, пока страница открыта.
+  let lastAutoTick = 0;
+  async function autoTick() {
+    if (state.syncing) return;
+    lastAutoTick = Date.now();
+    const last = await db.metaGet('lastQuickSync', 0);
+    if (Date.now() - last > FULL_SYNC_INTERVAL) {
+      await runTask(fullSync, true);
+    } else {
+      await runTask(syncFeed, true);
+    }
+  }
+
+  if (!firstRun) {
+    resetFeed();
+    autoTick(); // сразу при открытии
+  }
+  setInterval(autoTick, AUTO_FEED_INTERVAL);
+
+  // Opera усыпляет фоновые вкладки — интервал в спячке не тикает, и после
+  // возврата лента выглядит замороженной. Поэтому синхронизируемся сразу при
+  // возврате на вкладку/фокусе, если с прошлого тика прошло больше 3 минут.
+  const tickIfStale = () => {
+    if (document.hidden || state.syncing) return;
+    if (Date.now() - lastAutoTick > 3 * 60e3) autoTick();
+  };
+  document.addEventListener('visibilitychange', tickIfStale);
+  window.addEventListener('focus', tickIfStale);
+
+  // «↑ N новых» применяется само, когда пользователь доскроллил к верху
+  window.addEventListener('scroll', () => {
+    if (state.pendingNew > 0 && window.scrollY < 100) {
+      state.pendingNew = 0;
+      $('btnFresh').hidden = true;
+      resetFeed();
+    }
+  }, { passive: true });
+
+  // Кнопки
+  $('btnStart').onclick = () =>
+    runTask(async () => {
+      await syncChannels();
+      fillChannelFilter();
+      $('welcome').hidden = true;
+      await quickSync();
+      await importHistory();
+    });
+  $('btnSync').onclick = () => runTask(fullSync);
+  $('btnFresh').onclick = () => {
+    state.pendingNew = 0;
+    $('btnFresh').hidden = true;
+    window.scrollTo(0, 0);
+    resetFeed();
+  };
+  $('btnYoutube').onclick = () => window.open('https://www.youtube.com/feed/subscriptions', '_blank');
+  $('btnAbort').onclick = () => { state.abort = true; };
+  $('btnChannels').onclick = () => {
+    $('channelPanel').hidden = false;
+    renderChannelPanel();
+  };
+  $('btnExport').onclick = () => exportBackup();
+  $('btnImport').onclick = () => $('importFile').click();
+  $('importFile').onchange = (e) => {
+    const f = e.target.files[0];
+    if (f) importBackup(f);
+    e.target.value = '';
+  };
+  $('btnCloseChannels').onclick = () => { $('channelPanel').hidden = true; };
+  $('btnResetAllWatched').onclick = async () => {
+    const input = window.prompt(
+      'Сбросить отметки «просмотрено» для ВСЕХ каналов.\n'
+      + 'Оставьте поле пустым, чтобы сбросить всё, или введите дату (ГГГГ-ММ-ДД) — '
+      + 'будут сброшены только видео, опубликованные начиная с неё.',
+      ''
+    );
+    if (input === null) return; // отмена
+    const trimmed = input.trim();
+    let cutoffTs = null;
+    if (trimmed) {
+      const d = new Date(trimmed);
+      if (isNaN(d.getTime())) {
+        status('Не удалось разобрать дату — используйте формат ГГГГ-ММ-ДД');
+        return;
+      }
+      cutoffTs = d.getTime();
+    } else if (!window.confirm('Сбросить «просмотрено» для ВСЕХ видео ВСЕХ каналов?')) {
+      return;
+    }
+    status('Сбрасываю отметки «просмотрено»…');
+    const n = await resetAllWatched(cutoffTs);
+    status(`Сброшено отметок «просмотрено»: ${n}`);
+    renderChannelPanel();
+    await refreshStats();
+    resetFeed();
+  };
+  $('btnUnhideAll').onclick = async () => {
+    if (!window.confirm('Вернуть ВСЕ скрытые видео (кроме лежащих в «Смотреть позже»)?')) return;
+    status('Возвращаю скрытые видео…');
+    const n = await unhideAll();
+    status(`Возвращено скрытых видео: ${n}`);
+    await refreshStats();
+    resetFeed();
+  };
+  let chSearchTimer = null;
+  $('channelSearch').oninput = (e) => {
+    $('channelSearchClear').hidden = !e.target.value;
+    clearTimeout(chSearchTimer);
+    chSearchTimer = setTimeout(renderChannelPanel, 200);
+  };
+  $('channelSearchClear').onclick = () => {
+    $('channelSearch').value = '';
+    $('channelSearchClear').hidden = true;
+    clearTimeout(chSearchTimer);
+    renderChannelPanel();
+    $('channelSearch').focus();
+  };
+
+  // Фильтры
+  $('hideWatched').onchange = (e) => {
+    state.filters.hideWatched = e.target.checked;
+    resetFeed();
+  };
+  $('hideHidden').onchange = (e) => {
+    state.filters.hideHidden = e.target.checked;
+    resetFeed();
+  };
+  let searchTimer = null;
+  $('search').oninput = (e) => {
+    $('searchClear').hidden = !e.target.value;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      state.filters.search = e.target.value.trim().toLowerCase();
+      resetFeed();
+    }, 250);
+  };
+  $('searchClear').onclick = () => {
+    $('search').value = '';
+    $('searchClear').hidden = true;
+    clearTimeout(searchTimer);
+    state.filters.search = '';
+    resetFeed();
+    $('search').focus();
+  };
+  $('channelFilter').onchange = (e) => {
+    state.filters.channel = e.target.value;
+    resetFeed();
+  };
+  $('btnSortDir').onclick = () => {
+    state.filters.sortDir = state.filters.sortDir === 'asc' ? 'desc' : 'asc';
+    $('btnSortDir').textContent = sortDirLabel();
+    resetFeed();
+  };
+
+  // Бесконечная прокрутка
+  new IntersectionObserver((entries) => {
+    if (entries.some((x) => x.isIntersecting)) loadMore();
+  }, { rootMargin: '1200px' }).observe($('sentinel'));
+}
+
+init();
