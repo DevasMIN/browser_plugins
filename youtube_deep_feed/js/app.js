@@ -54,6 +54,7 @@ const state = {
   syncing: false,
   abort: false,
   pendingNew: 0,
+  liveAnnounce: false, // true во время фонового тика: новые видео показываются сразу
 };
 
 /**
@@ -66,10 +67,16 @@ const SYNCABLE_HIDE_SRC = new Set(['manual', 'yt-feedback', 'wl']);
 const SYNC_KEY_PREFIX = 'dfh_';
 const SYNC_CHUNK_CHARS = 7000;
 
-/** Лёгкая автопроверка новых видео (нативная лента), пока страница открыта. */
+/** Фоновый тик (лента + ротация каналов), пока страница открыта. */
 const AUTO_FEED_INTERVAL = 15 * 60e3;
-/** Полный обход каналов — не чаще, чем раз в столько. */
-const FULL_SYNC_INTERVAL = 6 * 3600e3;
+/** Список подписок (новые/отписанные каналы) обновляем не чаще, чем раз в столько. */
+const SUBS_LIST_REFRESH_INTERVAL = 6 * 3600e3;
+/**
+ * Сколько каналов проверять (первая страница) за один фоновый тик.
+ * Обход всех ~270 каналов сразу занимал минуты и блокировал показ новых видео —
+ * вместо этого проверяем понемногу самые давно не обновлявшиеся, ротацией.
+ */
+const ROTATE_BATCH_SIZE = 25;
 
 const $ = (id) => document.getElementById(id);
 
@@ -401,6 +408,7 @@ async function syncFeed() {
     await sleep(REQUEST_DELAY);
     json = await browse({ continuation: token });
   }
+  announceNewVideos(newCount);
 
   // Дифф скрытых: внутри фактического окна ленты (от самого старого её видео),
   // с отступами от краёв. Старый край: дата «N дней назад» имеет точность в день,
@@ -506,7 +514,20 @@ async function syncChannel(ch) {
   return added;
 }
 
-/** Синхронизация всех каналов: новые видео + поддержание запаса вглубь. */
+/**
+ * Синхронизирует один канал и сразу отражает найденное в ленте (см.
+ * announceNewVideos — вне фонового тика это no-op, обычная ручная
+ * синхронизация по-прежнему обновляет ленту целиком в конце).
+ */
+async function syncChannelAnnounced(ch) {
+  const n = await syncChannel(ch);
+  announceNewVideos(n);
+  ch.lastSync = Date.now();
+  await db.put('channels', ch);
+  return n;
+}
+
+/** Полный обход всех каналов — используется вручную (кнопка «Синхронизация»). */
 async function quickSync() {
   let totalNew = await syncFeed();
   const list = [...state.channels.values()].filter((c) => c.enabled && !c.hiddenChannel);
@@ -515,9 +536,7 @@ async function quickSync() {
     checkAbort();
     status(`Синхронизация: ${ch.title} (${done + 1}/${list.length})`, (done / list.length) * 100);
     try {
-      totalNew += await syncChannel(ch);
-      ch.lastSync = Date.now();
-      await db.put('channels', ch);
+      totalNew += await syncChannelAnnounced(ch);
     } catch (e) {
       if (e.message === 'aborted') throw e;
       console.warn('sync fail', ch.title, e);
@@ -527,6 +546,39 @@ async function quickSync() {
   }
   await db.metaSet('lastQuickSync', Date.now());
   status(`Готово: +${totalNew} новых видео`);
+  return totalNew;
+}
+
+/** N каналов, дольше всех не проверявшихся (по lastSync), для фоновой ротации. */
+function pickStaleChannels(n) {
+  return [...state.channels.values()]
+    .filter((c) => c.enabled && !c.hiddenChannel)
+    .sort((a, b) => (a.lastSync || 0) - (b.lastSync || 0))
+    .slice(0, n);
+}
+
+/**
+ * Фоновый тик: лента подписок (дёшево, покрывает почти все свежие видео)
+ * + небольшая ротация из ROTATE_BATCH_SIZE самых давно проверенных каналов —
+ * подчищает то, что могло не попасть в ленту, и постепенно докачивает архив
+ * ещё не до конца просканированных каналов. Полный обход всех ~270 каналов
+ * разом (как раньше делал quickSync каждые 6 часов) занимал минуты и всё
+ * это время не показывал уже найденные новые видео — с ротацией каждый тик
+ * короткий, а найденное видно сразу (announceNewVideos).
+ */
+async function rotateSync() {
+  let totalNew = await syncFeed();
+  const batch = pickStaleChannels(ROTATE_BATCH_SIZE);
+  for (const ch of batch) {
+    checkAbort();
+    try {
+      totalNew += await syncChannelAnnounced(ch);
+    } catch (e) {
+      if (e.message === 'aborted') throw e;
+      console.warn('rotate fail', ch.title, e);
+    }
+    await sleep(REQUEST_DELAY);
+  }
   return totalNew;
 }
 
@@ -565,35 +617,43 @@ async function importHistory() {
 }
 
 /**
+ * Показывает новые видео сразу, как только они найдены, не дожидаясь конца
+ * всей синхронизации. Работает только в фоновых тиках (state.liveAnnounce) —
+ * при ручной синхронизации это no-op, лента обновляется целиком в конце
+ * (runTask сам делает resetFeed), чтобы не дёргать DOM 270 раз подряд.
+ */
+function announceNewVideos(count) {
+  if (count <= 0 || !state.liveAnnounce) return;
+  if (window.scrollY < 200) {
+    resetFeed();
+  } else {
+    state.pendingNew += count;
+    const b = $('btnFresh');
+    b.textContent = `↑ ${state.pendingNew} новых`;
+    b.hidden = false;
+  }
+}
+
+/**
  * Обёртка запуска задач синхронизации.
- * auto=true — фоновый запуск: ленту не перерисовываем из-под прокрутки,
- * а при новых видео показываем кнопку «↑ N новых» (или обновляем сразу,
- * если пользователь и так вверху страницы).
+ * auto=true — фоновый запуск: новые видео показываются сразу по ходу
+ * (announceNewVideos внутри самой синхронизации), а не одним махом в конце.
  */
 async function runTask(fn, auto = false) {
   if (state.syncing) return;
   setSyncing(true);
+  state.liveAnnounce = auto;
   try {
-    const added = await fn();
+    await fn();
     await refreshStats();
-    if (!auto) {
-      resetFeed();
-    } else if (added > 0) {
-      if (window.scrollY < 200) {
-        resetFeed();
-      } else {
-        state.pendingNew += added;
-        const b = $('btnFresh');
-        b.textContent = `↑ ${state.pendingNew} новых`;
-        b.hidden = false;
-      }
-    }
+    if (!auto) resetFeed();
   } catch (e) {
     if (e.message !== 'aborted') {
       console.error(e);
       status(`Ошибка: ${e.message}. Проверьте, что вы залогинены на youtube.com в этом браузере.`);
     }
   } finally {
+    state.liveAnnounce = false;
     state.syncing = false;
     $('btnAbort').hidden = true;
     for (const id of ['btnSync', 'btnHistory', 'btnStart']) {
@@ -1148,24 +1208,33 @@ async function init() {
   const firstRun = state.channels.size === 0;
   $('welcome').hidden = !firstRun;
 
+  /** Полный обход всех каналов — только вручную (кнопка «Синхронизация»). */
   async function fullSync() {
     await syncChannels();
     fillChannelFilter();
     return quickSync();
   }
 
-  // Автосинхронизация: лёгкая проверка ленты каждые 15 минут,
-  // полный обход каналов — раз в 6 часов. Работает, пока страница открыта.
+  /**
+   * Автосинхронизация, пока страница открыта: каждые 15 минут — лента
+   * подписок + небольшая ротация каналов (rotateSync), быстро и с показом
+   * новых видео сразу. Список подписок (новые/отписанные каналы) обновляем
+   * заметно реже — это не влияет на срочность показа новых видео.
+   */
   let lastAutoTick = 0;
   async function autoTick() {
     if (state.syncing) return;
     lastAutoTick = Date.now();
-    const last = await db.metaGet('lastQuickSync', 0);
-    if (Date.now() - last > FULL_SYNC_INTERVAL) {
-      await runTask(fullSync, true);
-    } else {
-      await runTask(syncFeed, true);
-    }
+    const lastSubs = await db.metaGet('lastSubsRefresh', 0);
+    const needSubs = Date.now() - lastSubs > SUBS_LIST_REFRESH_INTERVAL;
+    await runTask(async () => {
+      if (needSubs) {
+        await syncChannels();
+        fillChannelFilter();
+        await db.metaSet('lastSubsRefresh', Date.now());
+      }
+      return rotateSync();
+    }, true);
   }
 
   if (!firstRun) {
