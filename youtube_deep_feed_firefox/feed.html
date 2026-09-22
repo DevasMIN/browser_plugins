@@ -20,8 +20,6 @@
     <button id="btnSortDir" title="Переключить порядок сортировки ленты по дате публикации">↓ новые→старые</button>
     <label class="toggle"><input type="checkbox" id="hideWatched" checked> скрывать просмотренные</label>
     <label class="toggle"><input type="checkbox" id="hideHidden" checked> скрывать скрытые</label>
-    <button id="btnShuffle" title="Показать 3 случайных видео вместо всей ленты. Повторное нажатие — новая тройка">🎲 3 случайных</button>
-    <button id="btnShuffleExit" title="Вернуться к обычной ленте" hidden>↩ Вся лента</button>
     <button id="btnSync" title="Подписки, новые видео и полная индексация/проверка новых видео">Синхронизация</button>
     <button id="btnYoutube" title="Открыть ленту подписок на youtube.com в новой вкладке">YouTube</button>
     <button id="btnChannels">Каналы</button>
@@ -30,6 +28,18 @@
     <input id="importFile" type="file" accept="application/json,.json" hidden>
     <button id="btnAbort" class="danger" hidden>Стоп</button>
   </header>
+
+  <div id="shuffleBar">
+    <span class="shuffleBarLabel">🎲 Случайные видео</span>
+    <div class="stepper">
+      <button id="shuffleDec" type="button" title="Меньше">−</button>
+      <input id="shuffleCount" type="number" min="1" max="50" value="6" title="Сколько случайных видео показывать">
+      <button id="shuffleInc" type="button" title="Больше">+</button>
+    </div>
+    <button id="btnShuffle" title="Показать случайные видео вместо всей ленты. Повторное нажатие (или клавиша R) — новая подборка">Показать</button>
+    <button id="btnShuffleExit" title="Вернуться к обычной ленте" hidden>↩ Вся лента</button>
+    <span class="shuffleHint">клавиша <kbd>R</kbd> — новая подборка</span>
+  </div>
 
   <div id="status" hidden>
     <div id="statusText"></div>

@@ -67,7 +67,8 @@ const state = {
   abort: false,
   pendingNew: 0,
   liveAnnounce: false, // true во время фонового тика: новые видео показываются сразу
-  shuffleMode: false,  // true — на экране только SHUFFLE_SIZE случайных видео
+  shuffleMode: false,  // true — на экране только shuffleSize случайных видео
+  shuffleSize: 6,       // настраивается полем ввода рядом с кнопкой, хранится в БД
 };
 
 /**
@@ -79,8 +80,6 @@ const SYNCABLE_HIDE_SRC = new Set(['manual', 'yt-feedback', 'wl']);
 /** Префикс и размер чанков зеркала скрытого в browserAPI.storage.sync. */
 const SYNC_KEY_PREFIX = 'dfh_';
 const SYNC_CHUNK_CHARS = 7000;
-/** Сколько видео показывает режим «случайные». */
-const SHUFFLE_SIZE = 3;
 
 /** Фоновый тик (лента + ротация каналов), пока страница открыта. */
 const AUTO_FEED_INTERVAL = 15 * 60e3;
@@ -1054,15 +1053,15 @@ function resetFeed() {
 }
 
 /**
- * Показывает SHUFFLE_SIZE случайных видео вместо всей ленты. Повторный вызов
- * (повторное нажатие кнопки, либо автоматически, когда все текущие случайные
- * видео скрыты/просмотрены) выбирает новую тройку.
+ * Показывает state.shuffleSize случайных видео вместо всей ленты. Повторный
+ * вызов (повторное нажатие кнопки, клавиша R, либо автоматически, когда все
+ * текущие случайные видео скрыты/просмотрены) выбирает новую подборку.
  */
 async function renderShuffle() {
   state.shuffleMode = true;
   feedGen++; // отменяем любую незавершённую подгрузку обычной ленты
   $('btnShuffleExit').hidden = false;
-  const items = await db.sampleVideos({ accept: acceptVideo, n: SHUFFLE_SIZE });
+  const items = await db.sampleVideos({ accept: acceptVideo, n: state.shuffleSize });
   // Пока ждали выборку, режим могли уже выключить (быстрый повторный клик
   // по «Вся лента») — не перезаписываем ленту устаревшим результатом.
   if (!state.shuffleMode) return;
@@ -1079,7 +1078,7 @@ async function renderShuffle() {
   $('feed').appendChild(frag);
 }
 
-/** Если после скрытия/просмотра в режиме «случайные» карточек не осталось — новая тройка. */
+/** Если после скрытия/просмотра в режиме «случайные» карточек не осталось — новая подборка. */
 function maybeReshuffle() {
   if (state.shuffleMode && $('feed').children.length === 0) renderShuffle();
 }
@@ -1343,6 +1342,8 @@ async function init() {
     if (SYNCABLE_HIDE_SRC.has(h.src) || h.src === 'sync') state.hiddenSync.add(h.id);
   }
   state.wl = new Set(await db.metaGet('wl', []));
+  state.shuffleSize = await db.metaGet('shuffleSize', 6);
+  $('shuffleCount').value = state.shuffleSize;
 
   /** Каноничная метка видео, посчитанная от момента его попадания в базу. */
   const canonTs = (v) => {
@@ -1485,9 +1486,29 @@ async function init() {
     resetFeed();
   };
   $('btnYoutube').onclick = () => window.open('https://www.youtube.com/feed/subscriptions', '_blank');
-  // Повторное нажатие, пока режим уже включён, — новая случайная тройка.
+  // Повторное нажатие, пока режим уже включён, — новая случайная подборка.
   $('btnShuffle').onclick = () => { window.scrollTo(0, 0); renderShuffle(); };
   $('btnShuffleExit').onclick = () => resetFeed();
+  const setShuffleSize = async (n) => {
+    if (!Number.isFinite(n) || n < 1) n = 1;
+    if (n > 50) n = 50;
+    $('shuffleCount').value = n;
+    state.shuffleSize = n;
+    await db.metaSet('shuffleSize', n);
+    if (state.shuffleMode) renderShuffle(); // уже показываем подборку — сразу пересчитать под новый размер
+  };
+  $('shuffleCount').onchange = (e) => setShuffleSize(parseInt(e.target.value, 10));
+  $('shuffleDec').onclick = () => setShuffleSize(state.shuffleSize - 1);
+  $('shuffleInc').onclick = () => setShuffleSize(state.shuffleSize + 1);
+  // Хоткей R — реролл (или первый запуск режима «случайные»), пока фокус не в поле ввода.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'r' && e.key !== 'R') return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const tag = document.activeElement?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    window.scrollTo(0, 0);
+    renderShuffle();
+  });
   $('btnAbort').onclick = () => { state.abort = true; };
   $('btnChannels').onclick = () => {
     $('channelPanel').hidden = false;
