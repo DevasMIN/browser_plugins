@@ -103,6 +103,13 @@ button.danger:hover { background: #7a2222; }
   padding: 20px 16px;
 }
 
+.shuffleEmpty {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--fg2);
+  padding: 40px;
+}
+
 .card { position: relative; }
 
 .thumb {

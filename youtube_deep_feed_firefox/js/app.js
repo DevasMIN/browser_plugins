@@ -67,6 +67,7 @@ const state = {
   abort: false,
   pendingNew: 0,
   liveAnnounce: false, // true во время фонового тика: новые видео показываются сразу
+  shuffleMode: false,  // true — на экране только SHUFFLE_SIZE случайных видео
 };
 
 /**
@@ -78,6 +79,8 @@ const SYNCABLE_HIDE_SRC = new Set(['manual', 'yt-feedback', 'wl']);
 /** Префикс и размер чанков зеркала скрытого в browserAPI.storage.sync. */
 const SYNC_KEY_PREFIX = 'dfh_';
 const SYNC_CHUNK_CHARS = 7000;
+/** Сколько видео показывает режим «случайные». */
+const SHUFFLE_SIZE = 3;
 
 /** Фоновый тик (лента + ротация каналов), пока страница открыта. */
 const AUTO_FEED_INTERVAL = 15 * 60e3;
@@ -657,7 +660,9 @@ async function importHistory() {
  */
 function announceNewVideos(count) {
   if (count <= 0 || !state.liveAnnounce) return;
-  if (window.scrollY < 200) {
+  // В режиме «случайные» фоновое обновление не должно молча выкидывать
+  // пользователя обратно в полную ленту — просто копим значок.
+  if (!state.shuffleMode && window.scrollY < 200) {
     resetFeed();
   } else {
     state.pendingNew += count;
@@ -857,7 +862,10 @@ async function toggleWatched(v, card, btn) {
     await markWatched(v.id, 100, 'manual');
     card.classList.add('watched');
     btn.textContent = '↩ не смотрел';
-    if (state.filters.hideWatched) card.remove();
+    if (state.filters.hideWatched) {
+      card.remove();
+      maybeReshuffle();
+    }
   }
   refreshStats();
 }
@@ -945,6 +953,7 @@ async function hideVideo(v, card, btn) {
   }
 
   card.remove();
+  maybeReshuffle();
   showToast(fbOk ? 'Скрыто (и на YouTube)' : 'Скрыто', async () => {
     await removeHidden(v.id);
     if (undoToken) {
@@ -971,6 +980,7 @@ async function watchLater(v, card, btn) {
     state.wl.add(v.id);
     await addHidden(v.id, 'wl');
     card.remove();
+    maybeReshuffle();
     // Заодно скрываем и в нативной ленте YouTube — чтобы не кликать отдельно
     // «✕ скрыть» на то же видео.
     const { ok: fbOk, undoToken } = await feedbackHide(v);
@@ -995,7 +1005,18 @@ async function watchLater(v, card, btn) {
 // перерисовку (флаг loadingPage), и новые видео появлялись только после F5.
 let feedGen = 0;
 
+/** Полностью очищает #feed вместе со связанным состоянием превью (ленивая
+ * загрузка/blob-кэш) — общая часть между resetFeed() и renderShuffle(). */
+function clearFeedDom() {
+  thumbObserver.disconnect();
+  for (const u of liveThumbUrls) URL.revokeObjectURL(u);
+  liveThumbUrls = [];
+  $('feed').textContent = '';
+  $('feedEnd').hidden = true;
+}
+
 async function loadMore() {
+  if (state.shuffleMode) return; // в режиме «случайные» подгрузка по скроллу не нужна
   if (state.loadingPage || state.feedDone) return;
   state.loadingPage = true;
   const gen = feedGen;
@@ -1019,15 +1040,48 @@ async function loadMore() {
 }
 
 function resetFeed() {
+  // Любой сброс ленты (смена фильтра, отмена скрытия, «↑ новых» и т.п.)
+  // означает «покажи мне полную ленту» — выходим из режима «случайные».
+  if (state.shuffleMode) {
+    state.shuffleMode = false;
+    $('btnShuffleExit').hidden = true;
+  }
   feedGen++;
-  thumbObserver.disconnect();
-  for (const u of liveThumbUrls) URL.revokeObjectURL(u);
-  liveThumbUrls = [];
   state.cursor = null;
   state.feedDone = false;
-  $('feed').textContent = '';
-  $('feedEnd').hidden = true;
+  clearFeedDom();
   loadMore();
+}
+
+/**
+ * Показывает SHUFFLE_SIZE случайных видео вместо всей ленты. Повторный вызов
+ * (повторное нажатие кнопки, либо автоматически, когда все текущие случайные
+ * видео скрыты/просмотрены) выбирает новую тройку.
+ */
+async function renderShuffle() {
+  state.shuffleMode = true;
+  feedGen++; // отменяем любую незавершённую подгрузку обычной ленты
+  $('btnShuffleExit').hidden = false;
+  const items = await db.sampleVideos({ accept: acceptVideo, n: SHUFFLE_SIZE });
+  // Пока ждали выборку, режим могли уже выключить (быстрый повторный клик
+  // по «Вся лента») — не перезаписываем ленту устаревшим результатом.
+  if (!state.shuffleMode) return;
+  clearFeedDom();
+  if (!items.length) {
+    const p = document.createElement('p');
+    p.className = 'shuffleEmpty';
+    p.textContent = 'Нет подходящих видео для случайной подборки.';
+    $('feed').appendChild(p);
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const v of items) frag.appendChild(makeCard(v));
+  $('feed').appendChild(frag);
+}
+
+/** Если после скрытия/просмотра в режиме «случайные» карточек не осталось — новая тройка. */
+function maybeReshuffle() {
+  if (state.shuffleMode && $('feed').children.length === 0) renderShuffle();
 }
 
 async function refreshStats() {
@@ -1431,6 +1485,9 @@ async function init() {
     resetFeed();
   };
   $('btnYoutube').onclick = () => window.open('https://www.youtube.com/feed/subscriptions', '_blank');
+  // Повторное нажатие, пока режим уже включён, — новая случайная тройка.
+  $('btnShuffle').onclick = () => { window.scrollTo(0, 0); renderShuffle(); };
+  $('btnShuffleExit').onclick = () => resetFeed();
   $('btnAbort').onclick = () => { state.abort = true; };
   $('btnChannels').onclick = () => {
     $('channelPanel').hidden = false;

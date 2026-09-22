@@ -96,6 +96,43 @@ export async function metaSet(k, v) {
 }
 
 /**
+ * n случайных видео, проходящих accept(video), — резервуарная выборка по
+ * потоку курсора (без сортировки по ts, порядок сканирования не важен).
+ * maxScan ограничивает, сколько строк вообще просматриваем (не все могут
+ * подойти под accept), чтобы не сканировать всю базу на большой коллекции.
+ */
+export async function sampleVideos({ accept = () => true, n = 3, maxScan = 5000 }) {
+  const db = await openDb();
+  const store = tx(db, 'videos');
+  const reservoir = [];
+  let seen = 0;
+  let scanned = 0;
+  return new Promise((resolve, reject) => {
+    const req = store.openCursor();
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (!cur || scanned >= maxScan) {
+        resolve(reservoir);
+        return;
+      }
+      scanned++;
+      const v = cur.value;
+      if (accept(v)) {
+        if (reservoir.length < n) {
+          reservoir.push(v);
+        } else {
+          const j = Math.floor(Math.random() * (seen + 1));
+          if (j < n) reservoir[j] = v;
+        }
+        seen++;
+      }
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
  * Страница ленты: видео по убыванию ts начиная после курсора.
  * accept(video) — фильтр (просмотренные/скрытые/поиск); собирает до limit штук.
  * Возвращает {items, cursor, done}; cursor = [ts, id] последнего элемента.
