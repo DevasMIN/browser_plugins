@@ -13,6 +13,9 @@ import * as db from './db.js';
 
 /** Просмотренным считаем видео с прогрессом от этого процента. */
 const WATCHED_PCT = 90;
+/** Shorts маскируются под обычные видео в плейлисте загрузок — отличить можно
+ *  только по длительности. YouTube разрешает Shorts длиной до 3 минут. */
+const SHORTS_MAX_SEC = 180;
 /**
  * Максимум страниц полной индексации канала за один заход. Пока канал не
  * проиндексирован полностью (ch.backfillDone), докачиваем историю без оглядки
@@ -59,7 +62,7 @@ const state = {
   hidden: new Set(),     // videoId (скрытые: вручную, из ленты, WL и т.п.)
   hiddenSync: new Set(), // подмножество hidden, которое синхронизируем между устройствами
   wl: new Set(),         // videoId в плейлисте «Смотреть позже»
-  filters: { hideWatched: true, hideHidden: true, search: '', channel: '', sortDir: 'desc' },
+  filters: { hideWatched: true, hideHidden: true, hideShorts: true, search: '', channel: '', sortDir: 'desc' },
   cursor: null,
   feedDone: false,
   loadingPage: false,
@@ -720,6 +723,20 @@ function isWatchedVideo(v) {
   return watchedPctOf(v) >= WATCHED_PCT;
 }
 
+/** Секунды из строки длительности вида «0:20», «11:56», «1:23:45». */
+function durationSec(dur) {
+  if (!dur) return null;
+  const parts = dur.split(':').map(Number);
+  if (parts.some(Number.isNaN)) return null;
+  return parts.reduce((acc, n) => acc * 60 + n, 0);
+}
+
+/** Shorts в плейлисте загрузок неотличимы от обычных видео, кроме длительности. */
+function isShortVideo(v) {
+  const sec = durationSec(v.dur);
+  return sec != null && sec > 0 && sec <= SHORTS_MAX_SEC;
+}
+
 function acceptVideo(v) {
   if (state.wl.has(v.id)) return false; // уже в «Смотреть позже»
   if (state.filters.hideHidden && state.hidden.has(v.id)) return false;
@@ -727,6 +744,7 @@ function acceptVideo(v) {
   if (!ch || ch.hiddenChannel) return false;
   if (state.filters.channel && v.ch !== state.filters.channel) return false;
   if (state.filters.hideWatched && isWatchedVideo(v)) return false;
+  if (state.filters.hideShorts && isShortVideo(v)) return false;
   if (state.filters.search) {
     const s = state.filters.search;
     const chTitle = ch.title.toLowerCase();
@@ -1578,6 +1596,10 @@ async function init() {
   };
   $('hideHidden').onchange = (e) => {
     state.filters.hideHidden = e.target.checked;
+    resetFeed();
+  };
+  $('hideShorts').onchange = (e) => {
+    state.filters.hideShorts = e.target.checked;
     resetFeed();
   };
   let searchTimer = null;

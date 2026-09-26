@@ -10,6 +10,9 @@ import * as db from './db.js';
 
 /** Просмотренным считаем видео с прогрессом от этого процента. */
 const WATCHED_PCT = 90;
+/** Shorts маскируются под обычные видео в плейлисте загрузок — отличить можно
+ *  только по длительности. YouTube разрешает Shorts длиной до 3 минут. */
+const SHORTS_MAX_SEC = 180;
 /** Сколько непросмотренных видео держать в запасе у каждого канала. */
 const TARGET_UNWATCHED = 20;
 /** Максимум страниц подкачки вглубь на канал за одну синхронизацию. */
@@ -47,7 +50,7 @@ const state = {
   hidden: new Set(),     // videoId (скрытые: вручную, из ленты, WL и т.п.)
   hiddenSync: new Set(), // подмножество hidden, которое синхронизируем между устройствами
   wl: new Set(),         // videoId в плейлисте «Смотреть позже»
-  filters: { hideWatched: true, search: '', channel: '' },
+  filters: { hideWatched: true, hideShorts: true, search: '', channel: '' },
   cursor: null,
   feedDone: false,
   loadingPage: false,
@@ -687,6 +690,20 @@ function isWatchedVideo(v) {
   return watchedPctOf(v) >= WATCHED_PCT;
 }
 
+/** Секунды из строки длительности вида «0:20», «11:56», «1:23:45». */
+function durationSec(dur) {
+  if (!dur) return null;
+  const parts = dur.split(':').map(Number);
+  if (parts.some(Number.isNaN)) return null;
+  return parts.reduce((acc, n) => acc * 60 + n, 0);
+}
+
+/** Shorts в плейлисте загрузок неотличимы от обычных видео, кроме длительности. */
+function isShortVideo(v) {
+  const sec = durationSec(v.dur);
+  return sec != null && sec > 0 && sec <= SHORTS_MAX_SEC;
+}
+
 function acceptVideo(v) {
   if (state.hidden.has(v.id)) return false;
   if (state.wl.has(v.id)) return false; // уже в «Смотреть позже»
@@ -694,6 +711,7 @@ function acceptVideo(v) {
   if (!ch || ch.hiddenChannel) return false;
   if (state.filters.channel && v.ch !== state.filters.channel) return false;
   if (state.filters.hideWatched && isWatchedVideo(v)) return false;
+  if (state.filters.hideShorts && isShortVideo(v)) return false;
   if (state.filters.search) {
     const s = state.filters.search;
     const chTitle = ch.title.toLowerCase();
@@ -1376,6 +1394,10 @@ async function init() {
   // Фильтры
   $('hideWatched').onchange = (e) => {
     state.filters.hideWatched = e.target.checked;
+    resetFeed();
+  };
+  $('hideShorts').onchange = (e) => {
+    state.filters.hideShorts = e.target.checked;
     resetFeed();
   };
   let searchTimer = null;
