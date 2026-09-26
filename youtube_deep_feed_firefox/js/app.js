@@ -62,7 +62,7 @@ const state = {
   hidden: new Set(),     // videoId (скрытые: вручную, из ленты, WL и т.п.)
   hiddenSync: new Set(), // подмножество hidden, которое синхронизируем между устройствами
   wl: new Set(),         // videoId в плейлисте «Смотреть позже»
-  filters: { hideWatched: true, hideHidden: true, hideShorts: true, search: '', channel: '', sortDir: 'desc' },
+  filters: { hideWatched: true, hideHidden: true, search: '', channel: '', sortDir: 'desc' },
   cursor: null,
   feedDone: false,
   loadingPage: false,
@@ -312,6 +312,7 @@ async function noteWatched(id, percent, src) {
 
 /** Сохраняет порцию видео канала; возвращает сколько было новых. */
 async function storeVideos(ch, lockups) {
+  lockups = lockups.filter((v) => !isShortVideo(v)); // Shorts не считаются вообще
   const now = Date.now();
   const rows = [];
   let prevTs = null;
@@ -382,6 +383,7 @@ async function syncFeed() {
     checkAbort();
     const rows = [];
     for (const v of parseLockups(json)) {
+      if (isShortVideo(v)) continue; // Shorts не считаются вообще
       feedIds.add(v.id);
       const ts0 = parseRelativeDate(v.pubText, now);
       if (ts0 != null && ts0 < minTs) minTs = ts0;
@@ -744,7 +746,7 @@ function acceptVideo(v) {
   if (!ch || ch.hiddenChannel) return false;
   if (state.filters.channel && v.ch !== state.filters.channel) return false;
   if (state.filters.hideWatched && isWatchedVideo(v)) return false;
-  if (state.filters.hideShorts && isShortVideo(v)) return false;
+  if (isShortVideo(v)) return false; // Shorts не учитываются вообще, без переключателя
   if (state.filters.search) {
     const s = state.filters.search;
     const chTitle = ch.title.toLowerCase();
@@ -1596,10 +1598,6 @@ async function init() {
   };
   $('hideHidden').onchange = (e) => {
     state.filters.hideHidden = e.target.checked;
-    resetFeed();
-  };
-  $('hideShorts').onchange = (e) => {
-    state.filters.hideShorts = e.target.checked;
     resetFeed();
   };
   let searchTimer = null;
