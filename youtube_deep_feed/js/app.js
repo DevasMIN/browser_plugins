@@ -10,8 +10,9 @@ import * as db from './db.js';
 
 /** Просмотренным считаем видео с прогрессом от этого процента. */
 const WATCHED_PCT = 90;
-/** Shorts маскируются под обычные видео в плейлисте загрузок — отличить можно
- *  только по длительности. YouTube разрешает Shorts длиной до 3 минут. */
+/** Плейлист UULF YouTube чистит от Shorts сам. Только если его у канала нет и
+ *  пришлось читать полный UU, Shorts в нём отличимы лишь по длительности
+ *  (до 3 минут) — эвристика, поэтому применяется только к таким каналам. */
 const SHORTS_MAX_SEC = 180;
 /** Сколько непросмотренных видео держать в запасе у каждого канала. */
 const TARGET_UNWATCHED = 20;
@@ -298,7 +299,7 @@ async function noteWatched(id, percent, src) {
 
 /** Сохраняет порцию видео канала; возвращает сколько было новых. */
 async function storeVideos(ch, lockups) {
-  lockups = lockups.filter((v) => !isShortVideo(v)); // Shorts не считаются вообще
+  lockups = lockups.filter((v) => !isShortVideo(v, ch)); // Shorts не считаются вообще
   const now = Date.now();
   const rows = [];
   let prevTs = null;
@@ -369,7 +370,6 @@ async function syncFeed() {
     checkAbort();
     const rows = [];
     for (const v of parseLockups(json)) {
-      if (isShortVideo(v)) continue; // Shorts не считаются вообще
       feedIds.add(v.id);
       const ts0 = parseRelativeDate(v.pubText, now);
       if (ts0 != null && ts0 < minTs) minTs = ts0;
@@ -469,7 +469,7 @@ async function unwatchedCount(chId) {
   const vids = await db.getAllByIndex('videos', 'ch', chId);
   let n = 0;
   for (const v of vids) {
-    if (!state.hidden.has(v.id) && !isWatchedVideo(v) && !isShortVideo(v)) n++;
+    if (!state.hidden.has(v.id) && !isWatchedVideo(v) && !isShortVideo(v, state.channels.get(chId))) n++;
   }
   return n;
 }
@@ -700,8 +700,9 @@ function durationSec(dur) {
   return parts.reduce((acc, n) => acc * 60 + n, 0);
 }
 
-/** Shorts в плейлисте загрузок неотличимы от обычных видео, кроме длительности. */
-function isShortVideo(v) {
+/** Short ли видео канала. В UULF Shorts нет вовсе, так что эвристика только для UU. */
+function isShortVideo(v, ch) {
+  if (ch?.plKind !== 'UU') return false;
   const sec = durationSec(v.dur);
   return sec != null && sec > 0 && sec <= SHORTS_MAX_SEC;
 }
@@ -713,7 +714,7 @@ function acceptVideo(v) {
   if (!ch || ch.hiddenChannel) return false;
   if (state.filters.channel && v.ch !== state.filters.channel) return false;
   if (state.filters.hideWatched && isWatchedVideo(v)) return false;
-  if (isShortVideo(v)) return false; // Shorts не учитываются вообще, без переключателя
+  if (isShortVideo(v, ch)) return false; // Shorts не учитываются вообще, без переключателя
   if (state.filters.search) {
     const s = state.filters.search;
     const chTitle = ch.title.toLowerCase();
@@ -1209,6 +1210,15 @@ async function init() {
   state.wl = new Set(await db.metaGet('wl', []));
   state.shuffleSize = await db.metaGet('shuffleSize', 6);
   $('shuffleCount').value = state.shuffleSize;
+
+  // Миграция: версии с фильтром «короче 3 минут» теряли обычные короткие видео
+  // (и сдвигали вглубь прогресс индексации). Начинаем индексацию каналов заново.
+  if (!(await db.metaGet('shortsFilterRollback'))) {
+    const chs = [...state.channels.values()];
+    for (const ch of chs) { ch.backfillDone = 0; ch.nextToken = null; }
+    await db.bulkPut('channels', chs);
+    await db.metaSet('shortsFilterRollback', 1);
+  }
 
   /** Каноничная метка видео, посчитанная от момента его попадания в базу. */
   const canonTs = (v) => {
