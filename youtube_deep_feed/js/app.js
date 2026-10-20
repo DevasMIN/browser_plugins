@@ -49,7 +49,6 @@ const state = {
   channels: new Map(),   // id -> запись канала
   watched: new Map(),    // videoId -> pct
   hidden: new Set(),     // videoId (скрытые: вручную, из ленты, WL и т.п.)
-  hiddenSync: new Set(), // подмножество hidden, которое синхронизируем между устройствами
   wl: new Set(),         // videoId в плейлисте «Смотреть позже»
   filters: { hideWatched: true, search: '', channel: '' },
   cursor: null,
@@ -62,18 +61,6 @@ const state = {
   shuffleMode: false,  // true — на экране только shuffleSize случайных видео
   shuffleSize: 6,       // настраивается полем ввода рядом с кнопкой, хранится в БД
 };
-
-/**
- * Источники скрытия, которые синхронизируются между устройствами через
- * chrome.storage.sync. feed-diff НЕ синхронизируем — он заново вычисляется
- * из нативной ленты на каждом устройстве и раздул бы квоту sync.
- */
-const SYNCABLE_HIDE_SRC = new Set(['manual', 'yt-feedback', 'wl']);
-/** Префикс и размер чанков зеркала скрытого в chrome.storage.sync. */
-const SYNC_KEY_PREFIX = 'dfh_';
-const SYNC_CHUNK_CHARS = 7000;
-/** storage.sync: 100 КБ всего (≈14 чанков по 7 КБ ⇒ ~8000 id) — больше не влезает. */
-const SYNC_MAX_CHUNKS = 14;
 
 /** Фоновый тик (лента + ротация каналов), пока страница открыта. */
 const AUTO_FEED_INTERVAL = 15 * 60e3;
@@ -114,17 +101,11 @@ function checkAbort() {
 
 // ---------- Скрытое: хранение + синхронизация между устройствами ----------
 
-let syncPushTimer = null;
-
 /** Добавляет видео в скрытые (локально + IndexedDB + при необходимости в sync). */
 async function addHidden(id, src) {
   const first = !state.hidden.has(id);
   state.hidden.add(id);
   await db.put('hidden', { id, at: Date.now(), src });
-  if (SYNCABLE_HIDE_SRC.has(src) && !state.hiddenSync.has(id)) {
-    state.hiddenSync.add(id);
-    scheduleHiddenPush();
-  }
   return first;
 }
 
@@ -132,83 +113,6 @@ async function addHidden(id, src) {
 async function removeHidden(id) {
   state.hidden.delete(id);
   await db.del('hidden', id);
-  if (state.hiddenSync.delete(id)) scheduleHiddenPush();
-}
-
-function scheduleHiddenPush() {
-  if (!(chrome.storage && chrome.storage.sync)) return;
-  clearTimeout(syncPushTimer);
-  syncPushTimer = setTimeout(pushHiddenSync, 1500);
-}
-
-/**
- * Выкладывает syncable-скрытое в chrome.storage.sync (общий для всех устройств,
- * где включена синхронизация Chrome). Пишем чанками: у sync жёсткие лимиты
- * (100 КБ всего, 8 КБ на элемент). Перед записью подтягиваем чужие правки,
- * чтобы одновременная запись с двух устройств не затирала друг друга.
- */
-async function pushHiddenSync() {
-  if (!(chrome.storage && chrome.storage.sync)) return;
-  await pullHiddenSync();
-  // Не влезающее в квоту отбрасываем: сначала самое старое, «смотреть позже»
-  // (оно и так восстанавливается из плейлиста WL) — в первую очередь.
-  const rows = (await db.getAll('hidden')).filter((r) => state.hiddenSync.has(r.id));
-  rows.sort((a, b) => (a.src === 'wl') - (b.src === 'wl') || (b.at || 0) - (a.at || 0));
-  const chunks = [];
-  let cur = '';
-  let kept = 0;
-  for (const { id } of rows) {
-    if (cur.length + id.length + 1 > SYNC_CHUNK_CHARS) {
-      chunks.push(cur);
-      cur = '';
-      if (chunks.length >= SYNC_MAX_CHUNKS) break;
-    }
-    cur += (cur ? ',' : '') + id;
-    kept++;
-  }
-  if (cur && chunks.length < SYNC_MAX_CHUNKS) chunks.push(cur);
-  const total = rows.length;
-
-  const toSet = {};
-  chunks.forEach((c, i) => { toSet[SYNC_KEY_PREFIX + i] = c; });
-  try {
-    const all = await chrome.storage.sync.get(null);
-    const stale = Object.keys(all).filter((k) => k.startsWith(SYNC_KEY_PREFIX) && !(k in toSet));
-    if (stale.length) await chrome.storage.sync.remove(stale);
-    await chrome.storage.sync.set(toSet);
-  } catch (e) {
-    console.warn('sync push fail', e);
-    status(`Синхронизация скрытого: ошибка (${e.message}); id: ${kept} из ${total}, чанков: ${chunks.length}`);
-    return;
-  }
-  if (kept < total) {
-    status(`Синхронизация скрытого: влезло ${kept} из ${total} (лимит storage.sync ~100 КБ), остальные — только на этом устройстве`);
-  }
-}
-
-/** Подтягивает скрытое с других устройств (только добавление). Возвращает новые id. */
-async function pullHiddenSync() {
-  const added = [];
-  if (!(chrome.storage && chrome.storage.sync)) return added;
-  let all;
-  try {
-    all = await chrome.storage.sync.get(null);
-  } catch (e) {
-    return added;
-  }
-  for (const k of Object.keys(all)) {
-    if (!k.startsWith(SYNC_KEY_PREFIX) || typeof all[k] !== 'string') continue;
-    for (const id of all[k].split(',')) {
-      if (!id) continue;
-      state.hiddenSync.add(id);
-      if (!state.hidden.has(id)) {
-        state.hidden.add(id);
-        await db.put('hidden', { id, at: Date.now(), src: 'sync' });
-        added.push(id);
-      }
-    }
-  }
-  return added;
 }
 
 // ---------- «Смотреть позже» ----------
@@ -1218,7 +1122,6 @@ async function init() {
   for (const w of await db.getAll('watched')) state.watched.set(w.id, w.pct);
   for (const h of await db.getAll('hidden')) {
     state.hidden.add(h.id);
-    if (SYNCABLE_HIDE_SRC.has(h.src) || h.src === 'sync') state.hiddenSync.add(h.id);
   }
   state.wl = new Set(await db.metaGet('wl', []));
   state.shuffleSize = await db.metaGet('shuffleSize', 6);
@@ -1276,24 +1179,6 @@ async function init() {
     await db.bulkPut('videos', fixed);
     await db.metaSet('tsDaysFix', 1);
     status(fixed.length ? `Пересчитано дат: ${fixed.length}` : '');
-  }
-
-  // Синхронизация скрытого между устройствами (chrome.storage.sync)
-  if (chrome.storage && chrome.storage.sync) {
-    await pullHiddenSync();  // подтянуть с других устройств
-    scheduleHiddenPush();    // выложить локальные, которых там ещё нет
-    chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== 'sync') return;
-      if (!Object.keys(changes).some((k) => k.startsWith(SYNC_KEY_PREFIX))) return;
-      pullHiddenSync().then((added) => {
-        if (!added.length) return;
-        for (const id of added) {
-          const c = $('feed').querySelector(`.card[data-id="${id}"]`);
-          if (c) c.remove();
-        }
-        refreshStats();
-      });
-    });
   }
 
   fillChannelFilter();
