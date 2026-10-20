@@ -72,6 +72,8 @@ const SYNCABLE_HIDE_SRC = new Set(['manual', 'yt-feedback', 'wl']);
 /** Префикс и размер чанков зеркала скрытого в chrome.storage.sync. */
 const SYNC_KEY_PREFIX = 'dfh_';
 const SYNC_CHUNK_CHARS = 7000;
+/** storage.sync: 100 КБ всего (≈14 чанков по 7 КБ ⇒ ~8000 id) — больше не влезает. */
+const SYNC_MAX_CHUNKS = 14;
 
 /** Фоновый тик (лента + ротация каналов), пока страница открыта. */
 const AUTO_FEED_INTERVAL = 15 * 60e3;
@@ -148,17 +150,24 @@ function scheduleHiddenPush() {
 async function pushHiddenSync() {
   if (!(chrome.storage && chrome.storage.sync)) return;
   await pullHiddenSync();
-  const ids = [...state.hiddenSync];
+  // Не влезающее в квоту отбрасываем: сначала самое старое, «смотреть позже»
+  // (оно и так восстанавливается из плейлиста WL) — в первую очередь.
+  const rows = (await db.getAll('hidden')).filter((r) => state.hiddenSync.has(r.id));
+  rows.sort((a, b) => (a.src === 'wl') - (b.src === 'wl') || (b.at || 0) - (a.at || 0));
   const chunks = [];
   let cur = '';
-  for (const id of ids) {
+  let kept = 0;
+  for (const { id } of rows) {
     if (cur.length + id.length + 1 > SYNC_CHUNK_CHARS) {
       chunks.push(cur);
       cur = '';
+      if (chunks.length >= SYNC_MAX_CHUNKS) break;
     }
     cur += (cur ? ',' : '') + id;
+    kept++;
   }
-  if (cur) chunks.push(cur);
+  if (cur && chunks.length < SYNC_MAX_CHUNKS) chunks.push(cur);
+  const total = rows.length;
 
   const toSet = {};
   chunks.forEach((c, i) => { toSet[SYNC_KEY_PREFIX + i] = c; });
@@ -169,7 +178,11 @@ async function pushHiddenSync() {
     await chrome.storage.sync.set(toSet);
   } catch (e) {
     console.warn('sync push fail', e);
-    status(`Синхронизация скрытого: не поместилось (${e.message})`);
+    status(`Синхронизация скрытого: ошибка (${e.message}); id: ${kept} из ${total}, чанков: ${chunks.length}`);
+    return;
+  }
+  if (kept < total) {
+    status(`Синхронизация скрытого: влезло ${kept} из ${total} (лимит storage.sync ~100 КБ), остальные — только на этом устройстве`);
   }
 }
 
