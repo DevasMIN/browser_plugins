@@ -60,6 +60,7 @@ const stableTs = (canon, id) =>
 const state = {
   channels: new Map(),   // id -> запись канала
   watched: new Map(),    // videoId -> pct
+  manualWatched: new Set(), // videoId с ручной отметкой (src 'manual'): автоматика её не трогает
   hidden: new Set(),     // videoId (скрытые: вручную, из ленты, WL и т.п.)
   wl: new Set(),         // videoId в плейлисте «Смотреть позже»
   filters: { hideWatched: true, hideHidden: true, search: '', channel: '', sortDir: 'desc' },
@@ -221,6 +222,7 @@ async function fetchUploadsPage(ch, token = null) {
 /** Обновляет отметку просмотра, если новый процент больше сохранённого. */
 async function noteWatched(id, percent, src) {
   if (percent == null) return;
+  if (state.manualWatched.has(id)) return;
   const old = state.watched.get(id) ?? -1;
   if (percent > old) {
     state.watched.set(id, percent);
@@ -550,7 +552,7 @@ async function importHistory() {
     checkAbort();
     for (const h of parseHistory(json)) {
       const old = state.watched.get(h.id);
-      if (old != null && old >= h.percent) {
+      if (state.manualWatched.has(h.id) || (old != null && old >= h.percent)) {
         consecutiveKnown++;
       } else {
         consecutiveKnown = 0;
@@ -785,6 +787,7 @@ function makeCard(v) {
 
 async function markWatched(id, pct, src) {
   state.watched.set(id, pct);
+  if (src === 'manual') state.manualWatched.add(id);
   await db.put('watched', { id, pct, src, at: Date.now() });
 }
 
@@ -792,6 +795,7 @@ async function toggleWatched(v, card, btn) {
   if (isWatchedVideo(v)) {
     // Явный pct=0 перебивает и старую отметку, и водяной знак «только новые»
     state.watched.set(v.id, 0);
+    state.manualWatched.add(v.id);
     await db.put('watched', { id: v.id, pct: 0, src: 'manual', at: Date.now() });
     card.classList.remove('watched');
     btn.textContent = '✓ просмотрено';
@@ -1273,12 +1277,19 @@ function sortDirLabel() {
 async function init() {
   await db.openDb();
   for (const ch of await db.getAll('channels')) state.channels.set(ch.id, ch);
-  for (const w of await db.getAll('watched')) state.watched.set(w.id, w.pct);
+  for (const w of await db.getAll('watched')) {
+    state.watched.set(w.id, w.pct);
+    if (w.src === 'manual') state.manualWatched.add(w.id);
+  }
   for (const h of await db.getAll('hidden')) {
     state.hidden.add(h.id);
   }
   state.wl = new Set(await db.metaGet('wl', []));
   state.shuffleSize = await db.metaGet('shuffleSize', 6);
+  state.filters.hideWatched = await db.metaGet('hideWatched', true);
+  $('hideWatched').checked = state.filters.hideWatched;
+  state.filters.hideHidden = await db.metaGet('hideHidden', true);
+  $('hideHidden').checked = state.filters.hideHidden;
   $('shuffleCount').value = state.shuffleSize;
 
   // Миграция: версии с фильтром «короче 3 минут» теряли обычные короткие видео
@@ -1501,10 +1512,12 @@ async function init() {
   // Фильтры
   $('hideWatched').onchange = (e) => {
     state.filters.hideWatched = e.target.checked;
+    db.metaSet('hideWatched', e.target.checked);
     resetFeed();
   };
   $('hideHidden').onchange = (e) => {
     state.filters.hideHidden = e.target.checked;
+    db.metaSet('hideHidden', e.target.checked);
     resetFeed();
   };
   let searchTimer = null;
