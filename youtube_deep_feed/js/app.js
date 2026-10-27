@@ -45,6 +45,13 @@ const idHash = (s) => {
 const stableTs = (canon, id) =>
   canon.ts - (idHash(id) % Math.max(1000, Math.floor(canon.g / 2)));
 
+/** Видео старше этого возраста YouTube датирует лишь «N месяцев/лет назад». */
+const COARSE_MIN_AGE = 61 * 86400e3;
+const SPREAD_MONTH = 30.44 * 86400e3;
+const SPREAD_YEAR = 365.25 * 86400e3;
+/** Старше этого возраста окно растяжки — год, моложе (но старше COARSE_MIN_AGE) — месяц. */
+const SPREAD_YEAR_AGE = 2 * SPREAD_YEAR;
+
 const state = {
   channels: new Map(),   // id -> запись канала
   watched: new Map(),    // videoId -> pct
@@ -217,11 +224,10 @@ async function noteWatched(id, percent, src) {
 }
 
 /** Сохраняет порцию видео канала; возвращает сколько было новых. */
-async function storeVideos(ch, lockups) {
+async function storeVideos(ch, lockups, chain = { prevTs: null }) {
   lockups = lockups.filter((v) => !isShortVideo(v, ch)); // Shorts не считаются вообще
   const now = Date.now();
   const rows = [];
-  let prevTs = null;
   let added = 0;
   for (const v of lockups) {
     const existing = await db.get('videos', v.id);
@@ -229,15 +235,20 @@ async function storeVideos(ch, lockups) {
     let ts = existing?.ts ?? null;
     if (ts == null) {
       // Дата не распарсилась — держим порядок плейлиста, вставая чуть раньше соседа
-      ts = canon ? stableTs(canon, v.id) : (prevTs != null ? prevTs - 1000 : now);
+      ts = canon ? stableTs(canon, v.id) : (chain.prevTs != null ? chain.prevTs - 1000 : now);
       // Плейлист идёт от новых к старым: внутри одной «корзины» дат сохраняем
       // его порядок цепочкой −1с. Только внутри корзины: раньше цепочка тянулась
       // от любого соседа и утаскивала свежее видео к метке сильно старшего.
-      if (canon && prevTs != null && ts >= prevTs && prevTs > canon.ts - canon.g) {
-        ts = prevTs - 1000;
+      if (canon && chain.prevTs != null && ts >= chain.prevTs && chain.prevTs > canon.ts - canon.g) {
+        ts = chain.prevTs - 1000;
       }
     }
-    prevTs = ts;
+    // Старые видео: метка должна строго убывать по порядку плейлиста (в том числе
+    // между страницами) — по ней spreadOldBuckets восстанавливает хронологию канала.
+    if (canon && now - canon.ts >= COARSE_MIN_AGE && chain.prevTs != null && ts >= chain.prevTs) {
+      ts = chain.prevTs - 1000;
+    }
+    chain.prevTs = ts;
     if (!existing) added++;
     rows.push({
       id: v.id, ch: ch.id, title: v.title, dur: v.dur, views: v.views,
@@ -253,6 +264,40 @@ async function storeVideos(ch, lockups) {
   }
   await db.bulkPut('videos', rows);
   return added;
+}
+
+/**
+ * Старые видео («5 месяцев»/«12 лет назад») YouTube датирует лишь с точностью до
+ * месяца/года, а метка ставилась в одну точку — и все видео канала из одной
+ * «корзины» шли в ленте подряд сплошным блоком. Растягиваем их равномерно по
+ * календарному окну (месяц/год), сохраняя порядок канала (метка убывает по
+ * порядку плейлиста). Окна привязаны к абсолютному времени, поэтому повторный
+ * запуск ничего не двигает, пока набор видео не изменился.
+ */
+async function spreadOldBuckets(chId) {
+  const now = Date.now();
+  const old = (await db.getAllByIndex('videos', 'ch', chId)).filter((v) => now - v.ts >= COARSE_MIN_AGE);
+  if (old.length < 2) return 0;
+  old.sort((a, b) => b.ts - a.ts || (a.id < b.id ? -1 : 1));
+  const groups = new Map();
+  for (const v of old) {
+    const u = now - v.ts >= SPREAD_YEAR_AGE ? SPREAD_YEAR : SPREAD_MONTH;
+    const key = `${u}:${Math.floor(v.ts / u)}`;
+    let g = groups.get(key);
+    if (!g) groups.set(key, (g = { u, vids: [] }));
+    g.vids.push(v);
+  }
+  const changed = [];
+  for (const [key, g] of groups) {
+    const end = (Math.floor(g.vids[0].ts / g.u) + 1) * g.u;
+    const step = g.u / g.vids.length;
+    g.vids.forEach((v, i) => {
+      const ts = Math.round(end - (i + 0.5) * step);
+      if (ts !== v.ts) { v.ts = ts; changed.push(v); }
+    });
+  }
+  if (changed.length) await db.bulkPut('videos', changed);
+  return changed.length;
 }
 
 /**
@@ -393,19 +438,26 @@ async function unwatchedCount(chId) {
   return n;
 }
 
+async function syncChannel(ch) {
+  const added = await syncChannelCore(ch);
+  await spreadOldBuckets(ch.id);
+  return added;
+}
+
 /**
  * Синхронизация канала: первая страница (~100 видео) + подкачка вглубь,
  * пока в запасе не наберётся TARGET_UNWATCHED непросмотренных.
  * Прогресс вглубь хранится в ch.nextToken и переживает перезапуски.
  */
-async function syncChannel(ch) {
+async function syncChannelCore(ch) {
   const { json, plKind } = await fetchUploadsPage(ch);
   if (!json) {
     ch.backfillDone = 1; // канал без загрузок (топик-каналы и т.п.)
     return 0;
   }
   ch.plKind = plKind;
-  let added = await storeVideos(ch, parseLockups(json));
+  const chain = { prevTs: null };
+  let added = await storeVideos(ch, parseLockups(json), chain);
   const page1Token = findToken(json);
   if (!ch.nextToken && !ch.backfillDone) ch.nextToken = page1Token;
   if (!ch.nextToken) ch.backfillDone = 1;
@@ -422,7 +474,7 @@ async function syncChannel(ch) {
     await sleep(REQUEST_DELAY);
     try {
       const cont = await browse({ continuation: ch.nextToken });
-      added += await storeVideos(ch, parseLockups(cont));
+      added += await storeVideos(ch, parseLockups(cont), chain);
       ch.nextToken = findToken(cont);
       if (!ch.nextToken) ch.backfillDone = 1;
       pages++;
@@ -1143,6 +1195,14 @@ async function init() {
     for (const ch of chs) { ch.backfillDone = 0; ch.nextToken = null; }
     await db.bulkPut('channels', chs);
     await db.metaSet('shortsFilterRollback', 1);
+  }
+
+  // Разовая растяжка старых видео по окнам (месяц/год) — см. spreadOldBuckets.
+  if (!(await db.metaGet('spreadV1'))) {
+    status('Разовое перемешивание старых видео…');
+    for (const ch of state.channels.values()) await spreadOldBuckets(ch.id);
+    await db.metaSet('spreadV1', 1);
+    status('');
   }
 
   /** Каноничная метка видео, посчитанная от момента его попадания в базу. */
