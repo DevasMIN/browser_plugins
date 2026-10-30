@@ -133,6 +133,35 @@ export async function sampleVideos({ accept = () => true, n = 3, maxScan = 5000 
 }
 
 /**
+ * По каналам: самое новое и самое старое видео среди проходящих accept.
+ * Один проход по ts_id от новых к старым: первое принятое видео канала —
+ * новейшее, последнее принятое — старейшее. Возвращает Map chId → {newest, oldest}.
+ */
+export async function channelEdges({ accept = () => true }) {
+  const db = await openDb();
+  const idx = tx(db, 'videos').index('ts_id');
+  const edges = new Map();
+  return new Promise((resolve, reject) => {
+    const req = idx.openCursor(null, 'prev');
+    req.onsuccess = () => {
+      const cur = req.result;
+      if (!cur) {
+        resolve(edges);
+        return;
+      }
+      const v = cur.value;
+      if (accept(v)) {
+        const e = edges.get(v.ch);
+        if (e) e.oldest = v;
+        else edges.set(v.ch, { newest: v, oldest: v });
+      }
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
  * Страница ленты: видео по убыванию ts начиная после курсора.
  * accept(video) — фильтр (просмотренные/скрытые/поиск); собирает до limit штук.
  * Возвращает {items, cursor, done}; cursor = [ts, id] последнего элемента.

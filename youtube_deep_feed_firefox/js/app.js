@@ -78,6 +78,7 @@ const state = {
   abort: false,
   pendingNew: 0,
   liveAnnounce: false, // true во время фонового тика: новые видео показываются сразу
+  edgesMode: false,    // true — на экране первое и последнее видео каждого канала
   shuffleMode: false,  // true — на экране только shuffleSize случайных видео
   shuffleSize: 6,       // настраивается полем ввода рядом с кнопкой, хранится в БД
 };
@@ -637,7 +638,7 @@ function announceNewVideos(count) {
   if (count <= 0 || !state.liveAnnounce) return;
   // В режиме «случайные» фоновое обновление не должно молча выкидывать
   // пользователя обратно в полную ленту — просто копим значок.
-  if (!state.shuffleMode && window.scrollY < 200) {
+  if (!state.shuffleMode && !state.edgesMode && window.scrollY < 200) {
     resetFeed();
   } else {
     state.pendingNew += count;
@@ -761,7 +762,7 @@ async function loadThumb(id, img) {
   }
 }
 
-function makeCard(v) {
+function makeCard(v, edge = null) {
   const ch = state.channels.get(v.ch);
   const pct = state.watched.get(v.id) ?? 0;
 
@@ -789,6 +790,15 @@ function makeCard(v) {
     kb.textContent =
       v.kind === 'live' ? 'В ЭФИРЕ' : v.kind === 'upcoming' ? 'ЗАПЛАНИРОВАНО' : 'СТРИМ';
     thumb.appendChild(kb);
+  }
+  if (edge) {
+    const eb = document.createElement('span');
+    eb.className = 'edgeBadge ' + edge;
+    eb.textContent = edge === 'newest' ? 'последнее' : 'первое';
+    if (edge === 'oldest' && ch && !ch.backfillDone) {
+      eb.title = 'Архив канала ещё не проиндексирован до конца — это самое старое из найденных';
+    }
+    thumb.appendChild(eb);
   }
   if (pct > 0) {
     const bar = document.createElement('div');
@@ -1009,7 +1019,7 @@ function clearFeedDom() {
 }
 
 async function loadMore() {
-  if (state.shuffleMode) return; // в режиме «случайные» подгрузка по скроллу не нужна
+  if (state.shuffleMode || state.edgesMode) return; // в спец-режимах подгрузка по скроллу не нужна
   if (state.loadingPage || state.feedDone) return;
   state.loadingPage = true;
   const gen = feedGen;
@@ -1035,8 +1045,9 @@ async function loadMore() {
 function resetFeed() {
   // Любой сброс ленты (смена фильтра, отмена скрытия, «↑ новых» и т.п.)
   // означает «покажи мне полную ленту» — выходим из режима «случайные».
-  if (state.shuffleMode) {
+  if (state.shuffleMode || state.edgesMode) {
     state.shuffleMode = false;
+    state.edgesMode = false;
     $('btnShuffleExit').hidden = true;
   }
   feedGen++;
@@ -1053,6 +1064,7 @@ function resetFeed() {
  */
 async function renderShuffle() {
   state.shuffleMode = true;
+  state.edgesMode = false;
   feedGen++; // отменяем любую незавершённую подгрузку обычной ленты
   $('btnShuffleExit').hidden = false;
   const items = await db.sampleVideos({ accept: acceptVideo, n: state.shuffleSize });
@@ -1069,6 +1081,36 @@ async function renderShuffle() {
   }
   const frag = document.createDocumentFragment();
   for (const v of items) frag.appendChild(makeCard(v));
+  $('feed').appendChild(frag);
+}
+
+/**
+ * Режим «первое и последнее»: для КАЖДОГО канала (с учётом всех фильтров и галочек —
+ * тот же acceptVideo) показывает самое новое и самое старое видео. Каналы идут
+ * по дате новейшего видео, у канала с единственным видео — одна карточка.
+ */
+async function renderEdges() {
+  state.edgesMode = true;
+  state.shuffleMode = false;
+  feedGen++; // отменяем незавершённую подгрузку обычной ленты
+  $('btnShuffleExit').hidden = false;
+  const edges = await db.channelEdges({ accept: acceptVideo });
+  // Пока читали базу, режим могли выключить или сменить — не затираем ленту устаревшим результатом.
+  if (!state.edgesMode) return;
+  clearFeedDom();
+  if (!edges.size) {
+    const p = document.createElement('p');
+    p.className = 'shuffleEmpty';
+    p.textContent = 'Нет подходящих видео.';
+    $('feed').appendChild(p);
+    return;
+  }
+  const list = [...edges.values()].sort((a, b) => b.newest.ts - a.newest.ts);
+  const frag = document.createDocumentFragment();
+  for (const { newest, oldest } of list) {
+    frag.appendChild(makeCard(newest, 'newest'));
+    if (oldest !== newest) frag.appendChild(makeCard(oldest, 'oldest'));
+  }
   $('feed').appendChild(frag);
 }
 
@@ -1487,6 +1529,7 @@ async function init() {
   // Повторное нажатие, пока режим уже включён, — новая случайная подборка.
   $('btnShuffle').onclick = () => { window.scrollTo(0, 0); renderShuffle(); };
   $('btnShuffleExit').onclick = () => resetFeed();
+  $('btnEdges').onclick = () => { window.scrollTo(0, 0); renderEdges(); };
   const setShuffleSize = async (n) => {
     if (!Number.isFinite(n) || n < 1) n = 1;
     if (n > 50) n = 50;
