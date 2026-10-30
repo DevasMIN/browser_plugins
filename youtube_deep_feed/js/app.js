@@ -465,6 +465,7 @@ async function syncChannelCore(ch) {
 
   let pages = 0;
   let triedFresh = false;
+  let emptyRetries = 0;
   while (
     !ch.backfillDone &&
     !ch.onlyNew &&
@@ -475,8 +476,16 @@ async function syncChannelCore(ch) {
     await sleep(REQUEST_DELAY);
     try {
       const cont = await browse({ continuation: ch.nextToken });
-      added += await storeVideos(ch, parseLockups(cont), chain);
-      ch.nextToken = findToken(cont);
+      const lockups = parseLockups(cont);
+      const nextToken = findToken(cont);
+      // Страница без видео и без токена — не конец архива, а сбой/троттлинг YouTube:
+      // раньше канал тут помечался проиндексированным и навсегда застревал на этой глубине.
+      if (!lockups.length && !nextToken) {
+        if (emptyRetries++ < 2) { await sleep(1500); continue; }
+        break; // канал остаётся недоиндексированным, прогресс сохранён — продолжим в след. раз
+      }
+      added += await storeVideos(ch, lockups, chain);
+      ch.nextToken = nextToken;
       if (!ch.nextToken) ch.backfillDone = 1;
       pages++;
     } catch (e) {

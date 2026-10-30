@@ -503,13 +503,22 @@ async function syncChannelCore(ch) {
 
   let pages = 0;
   let triedFresh = false;
+  let emptyRetries = 0;
   while (!ch.backfillDone && pages < FULL_INDEX_MAX_PAGES) {
     checkAbort();
     await sleep(REQUEST_DELAY);
     try {
       const cont = await browse({ continuation: ch.nextToken });
-      added += await storeVideos(ch, parseLockups(cont), chain);
-      ch.nextToken = findToken(cont);
+      const lockups = parseLockups(cont);
+      const nextToken = findToken(cont);
+      // Страница без видео и без токена — не конец архива, а сбой/троттлинг YouTube:
+      // раньше канал тут помечался проиндексированным и навсегда застревал на этой глубине.
+      if (!lockups.length && !nextToken) {
+        if (emptyRetries++ < 2) { await sleep(1500); continue; }
+        break; // канал остаётся недоиндексированным, прогресс сохранён — продолжим в след. раз
+      }
+      added += await storeVideos(ch, lockups, chain);
+      ch.nextToken = nextToken;
       if (!ch.nextToken) ch.backfillDone = 1;
       pages++;
     } catch (e) {
@@ -1134,7 +1143,10 @@ async function refreshStats() {
     if (!ch || ch.hiddenChannel) continue;
     if (!isWatchedVideo(v)) unwatched++;
   }
-  $('stats').textContent = `${all.length} видео в базе · ${unwatched} к просмотру`;
+  const shallow = [...state.channels.values()]
+    .filter((c) => c.enabled && !c.hiddenChannel && !c.onlyNew && !c.backfillDone).length;
+  $('stats').textContent = `${all.length} видео в базе · ${unwatched} к просмотру`
+    + (shallow ? ` · не до конца: ${shallow} кан.` : '');
 }
 
 // ---------- Панель каналов ----------
@@ -1593,6 +1605,16 @@ async function init() {
     renderChannelPanel();
     await refreshStats();
     resetFeed();
+  };
+  $('btnReindex').onclick = async () => {
+    if (state.syncing) { status('Дождитесь конца текущей синхронизации или нажмите «Стоп»'); return; }
+    if (!window.confirm('Перепроверить глубину ВСЕХ каналов? Архив каждого канала будет пройден заново до самого '
+      + 'первого видео (уже сохранённое не дублируется). Это сотни запросов к YouTube, займёт десятки минут.')) return;
+    const chs = [...state.channels.values()].filter((c) => !c.onlyNew);
+    for (const ch of chs) { ch.backfillDone = 0; ch.nextToken = null; }
+    await db.bulkPut('channels', chs);
+    $('channelPanel').hidden = true;
+    runTask(quickSync);
   };
   $('btnUnhideAll').onclick = async () => {
     if (!window.confirm('Вернуть ВСЕ скрытые видео (кроме лежащих в «Смотреть позже»)?')) return;
