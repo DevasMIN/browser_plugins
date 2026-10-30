@@ -1086,8 +1086,8 @@ async function renderShuffle() {
 
 /**
  * Режим «первое и последнее»: для КАЖДОГО канала (с учётом всех фильтров и галочек —
- * тот же acceptVideo) показывает самое новое и самое старое видео. Каналы идут
- * по дате новейшего видео, у канала с единственным видео — одна карточка.
+ * тот же acceptVideo) показывает самое новое и самое старое видео. Все карточки
+ * идут одним списком по дате, как лента; у канала с единственным видео — одна карточка.
  */
 async function renderEdges() {
   state.edgesMode = true;
@@ -1105,12 +1105,16 @@ async function renderEdges() {
     $('feed').appendChild(p);
     return;
   }
-  const list = [...edges.values()].sort((a, b) => b.newest.ts - a.newest.ts);
-  const frag = document.createDocumentFragment();
-  for (const { newest, oldest } of list) {
-    frag.appendChild(makeCard(newest, 'newest'));
-    if (oldest !== newest) frag.appendChild(makeCard(oldest, 'oldest'));
+  // Общий список по дате (а не по каналам подряд): порядок как в ленте.
+  const list = [];
+  for (const { newest, oldest } of edges.values()) {
+    list.push({ v: newest, edge: 'newest' });
+    if (oldest !== newest) list.push({ v: oldest, edge: 'oldest' });
   }
+  const sign = state.filters.sortDir === 'asc' ? 1 : -1;
+  list.sort((a, b) => sign * (a.v.ts - b.v.ts) || (a.v.id < b.v.id ? -sign : sign));
+  const frag = document.createDocumentFragment();
+  for (const { v, edge } of list) frag.appendChild(makeCard(v, edge));
   $('feed').appendChild(frag);
 }
 
