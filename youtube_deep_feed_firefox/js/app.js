@@ -465,6 +465,7 @@ async function syncChannelCore(ch) {
   const { json, plKind } = await fetchUploadsPage(ch);
   if (!json) {
     ch.backfillDone = 1; // канал без загрузок (топик-каналы и т.п.)
+    ch.idx = { at: Date.now(), kind: null, p1: 0, pages: 0, added: 0, stop: 'no-uploads', err: null, restarts: 0 };
     return 0;
   }
   ch.plKind = plKind;
@@ -494,17 +495,31 @@ async function syncChannelCore(ch) {
         break;
       }
     }
+    ch.idx = { at: Date.now(), kind: plKind, p1: firstLockups.length, pages, added, stop: 'caught-up', err: null, restarts: 0 };
     return added;
   }
 
   if (!ch.nextToken) ch.nextToken = page1Token;
-  if (!ch.nextToken) { ch.backfillDone = 1; return added; }
-  if (ch.onlyNew) return added; // «только новые»: старое не докачиваем вовсе
+  if (!ch.nextToken) {
+    ch.backfillDone = 1;
+    ch.idx = { at: Date.now(), kind: plKind, p1: firstLockups.length, pages: 0, added, stop: 'done-p1', err: null, restarts: 0 };
+    return added;
+  }
+  if (ch.onlyNew) { // «только новые»: старое не докачиваем вовсе
+    ch.idx = { at: Date.now(), kind: plKind, p1: firstLockups.length, pages: 0, added, stop: 'only-new', err: null, restarts: 0 };
+    return added;
+  }
 
   let pages = 0;
   let triedFresh = false;
   let emptyRetries = 0;
-  while (!ch.backfillDone && pages < FULL_INDEX_MAX_PAGES) {
+  let errRetries = 0;
+  let restarts = 0;
+  let stop = 'limit';
+  let err = null;
+  while (true) {
+    if (ch.backfillDone) { stop = 'done'; break; }
+    if (pages >= FULL_INDEX_MAX_PAGES) break; // остальное — в следующую синхронизацию
     checkAbort();
     await sleep(REQUEST_DELAY);
     try {
@@ -515,23 +530,33 @@ async function syncChannelCore(ch) {
       // раньше канал тут помечался проиндексированным и навсегда застревал на этой глубине.
       if (!lockups.length && !nextToken) {
         if (emptyRetries++ < 2) { await sleep(1500); continue; }
-        break; // канал остаётся недоиндексированным, прогресс сохранён — продолжим в след. раз
+        stop = 'empty'; // канал остаётся недоиндексированным, прогресс сохранён
+        break;
       }
       added += await storeVideos(ch, lockups, chain);
       ch.nextToken = nextToken;
       if (!ch.nextToken) ch.backfillDone = 1;
       pages++;
+      errRetries = 0;
     } catch (e) {
       if (e.message === 'aborted') throw e;
-      // Сохранённый токен мог протухнуть — один раз начинаем заново с 1-й страницы
+      err = String(e.message || e).slice(0, 160);
+      // Сначала повторяем тот же токен с паузой (429/сеть — временные): раньше любая
+      // ошибка тут же отбрасывала весь накопленный прогресс обратно на 1-ю страницу.
+      if (errRetries++ < 3) { await sleep(2000 * errRetries); continue; }
+      // Токен мог протухнуть — один раз начинаем заново с 1-й страницы
       if (!triedFresh && page1Token) {
         triedFresh = true;
+        errRetries = 0;
+        restarts++;
         ch.nextToken = page1Token;
-      } else {
-        break;
+        continue;
       }
+      stop = 'error';
+      break;
     }
   }
+  ch.idx = { at: Date.now(), kind: plKind, p1: firstLockups.length, pages, added, stop, err, restarts };
   return added;
 }
 
@@ -566,7 +591,11 @@ async function quickSync() {
     await sleep(REQUEST_DELAY);
   }
   await db.metaSet('lastQuickSync', Date.now());
-  status(`Готово: +${totalNew} новых видео`);
+  const shallow = list.filter((c) => !c.backfillDone && !c.onlyNew);
+  const byStop = {};
+  for (const c of shallow) byStop[c.idx?.stop || '?'] = (byStop[c.idx?.stop || '?'] || 0) + 1;
+  status(`Готово: +${totalNew} новых видео`
+    + (shallow.length ? ` · не до конца: ${shallow.length} (${Object.entries(byStop).map(([k, n]) => `${k} ${n}`).join(', ')})` : ''));
   return totalNew;
 }
 
@@ -1332,6 +1361,61 @@ async function exportBackup() {
   status(`Экспортировано: ${total} видео, ${data.channels.length} каналов`);
 }
 
+/**
+ * Диагностика индексации: по каждому каналу — сколько видео в базе, самое старое,
+ * закончен ли обход архива и чем закончился последний обход (ch.idx). Сохраняется
+ * текстовым файлом, чтобы можно было разобрать, где и почему обход встал.
+ */
+async function exportIndexLog() {
+  status('Собираю диагностику индексации…');
+  const stat = new Map();
+  for (const v of await db.getAll('videos')) {
+    let s = stat.get(v.ch);
+    if (!s) stat.set(v.ch, (s = { n: 0, hid: 0, wat: 0, old: v, new: v }));
+    s.n++;
+    if (state.hidden.has(v.id)) s.hid++;
+    if (isWatchedVideo(v)) s.wat++;
+    if (v.ts < s.old.ts) s.old = v;
+    if (v.ts > s.new.ts) s.new = v;
+  }
+  const day = (ts) => new Date(ts).toISOString().slice(0, 10);
+  const chs = [...state.channels.values()].sort(
+    (a, b) => (a.backfillDone ? 1 : 0) - (b.backfillDone ? 1 : 0) || a.title.localeCompare(b.title, 'ru'));
+  const stops = {};
+  const errs = {};
+  const lines = [];
+  for (const ch of chs) {
+    const s = stat.get(ch.id);
+    const i = ch.idx;
+    if (!ch.backfillDone && !ch.onlyNew) stops[i?.stop || 'нет-данных'] = (stops[i?.stop || 'нет-данных'] || 0) + 1;
+    if (i?.err) errs[i.err] = (errs[i.err] || 0) + 1;
+    const flags = [ch.backfillDone ? 'DONE' : 'NOT-DONE', ch.onlyNew ? 'only-new' : '', ch.hiddenChannel ? 'channel-hidden' : '',
+      ch.enabled ? '' : 'disabled'].filter(Boolean).join(' ');
+    const oldest = s ? `${day(s.old.ts)} «${s.old.title}» ${s.old.id}${state.hidden.has(s.old.id) ? ' [скрыто]' : ''}` : '—';
+    const walk = i
+      ? `${Math.round((Date.now() - i.at) / 60000)} мин назад: pl=${i.kind} стр1=${i.p1} стр=${i.pages} +${i.added} stop=${i.stop}`
+        + `${i.err ? ` err=${i.err}` : ''}${i.restarts ? ` restarts=${i.restarts}` : ''}`
+      : 'обхода не было';
+    lines.push(`${ch.title} [${ch.id}] ${flags}\n    в базе ${s ? s.n : 0} (скрыто ${s ? s.hid : 0}, просмотрено ${s ? s.wat : 0}); `
+      + `старейшее: ${oldest}\n    ${walk}\n    nextToken=${ch.nextToken ? 'есть' : 'нет'}`);
+  }
+  const head = [
+    `Deep Feed — диагностика индексации, ${new Date().toISOString()}`,
+    `Каналов: ${chs.length}; не до конца: ${chs.filter((c) => !c.backfillDone && !c.onlyNew).length}`,
+    `Причины остановки (недоиндексированные): ${JSON.stringify(stops)}`,
+    `Ошибки: ${JSON.stringify(errs)}`,
+    '',
+  ];
+  const blob = new Blob([head.concat(lines).join('\n')], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `deepfeed-index-log-${new Date().toISOString().slice(0, 10)}.txt`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  status(`Диагностика сохранена: ${chs.length} каналов`);
+}
+
 /** Загружает базу из JSON-файла (слияние: существующие записи перезаписываются). */
 async function importBackup(file) {
   status('Читаю файл…');
@@ -1606,6 +1690,7 @@ async function init() {
     await refreshStats();
     resetFeed();
   };
+  $('btnIndexLog').onclick = () => exportIndexLog();
   $('btnReindex').onclick = async () => {
     if (state.syncing) { status('Дождитесь конца текущей синхронизации или нажмите «Стоп»'); return; }
     if (!window.confirm('Перепроверить глубину ВСЕХ каналов? Архив каждого канала будет пройден заново до самого '
