@@ -1293,6 +1293,30 @@ async function renderChannelPanel() {
       actions.appendChild(btnNew);
     }
 
+    // Индексация только этого канала: для проверки глубины, не дожидаясь обхода всех
+    const btnIndex = document.createElement('button');
+    btnIndex.textContent = '⟳ индекс';
+    btnIndex.title = 'Пройти архив только этого канала: у проиндексированного — заново с начала, '
+      + 'у недоиндексированного — продолжить с места остановки. Итог выводится в статусе';
+    btnIndex.onclick = async () => {
+      if (state.syncing) { status('Дождитесь конца текущей синхронизации или нажмите «Стоп»'); return; }
+      if (ch.backfillDone && !ch.onlyNew) { // перепроверка уже «готового» канала с нуля
+        ch.backfillDone = 0;
+        ch.nextToken = null;
+        await db.put('channels', ch);
+      }
+      await runTask(async () => {
+        status(`Индексация: ${ch.title}…`);
+        const n = await syncChannelAnnounced(ch);
+        const total = await db.count('videos', 'ch', ch.id);
+        const i = ch.idx || {};
+        status(`«${ch.title}»: +${n} новых, всего в базе ${total}; стр=${i.pages} stop=${i.stop}`
+          + `${i.err ? ` err=${i.err}` : ''}${ch.backfillDone ? ' — архив пройден до конца' : ' — НЕ до конца (нажмите ещё раз)'}`);
+      });
+      renderChannelPanel();
+    };
+    actions.appendChild(btnIndex);
+
     // Сброс «просмотрено»: весь канал целиком или только начиная с даты
     const btnReset = document.createElement('button');
     btnReset.textContent = '↺ сброс';
