@@ -48,6 +48,56 @@ function pauseAutoplayedVideos() {
   });
 }
 
+// --- Блокировка автозапуска при открытии страницы ---------------------------
+// Главный плеер можно запустить только пользователем: жест (клик, клавиша, тач) не
+// раньше GESTURE_WINDOW_MS назад, либо предыдущее видео только что доиграло само
+// (автопереход к следующему). Иначе видео ставится на паузу сразу после 'play'.
+// Разрешение действует, пока в элементе то же видео (сбрасывается на loadstart),
+// поэтому пауза/возобновление дальше работают как обычно.
+const GESTURE_WINDOW_MS = 15000;
+const NEXT_WINDOW_MS = 15000;
+let lastGestureAt = 0;
+let lastEndedAt = 0;
+const approvedVideos = new WeakSet();
+
+function noteGesture(e) {
+  if (!e.isTrusted) return;
+  // wheel считаем жестом только в Shorts (листание), чтобы прокрутка ленты не разрешала автозапуск
+  if (e.type === 'wheel' && !location.pathname.startsWith('/shorts')) return;
+  lastGestureAt = Date.now();
+}
+['pointerdown', 'mousedown', 'keydown', 'touchstart', 'wheel'].forEach((t) => {
+  window.addEventListener(t, noteGesture, { capture: true, passive: true });
+});
+
+// Превью при наведении на миниатюры — не главный плеер, их не трогаем
+function isPreviewVideo(video) {
+  return !!video.closest('ytd-video-preview, ytd-moving-thumbnail-renderer, ytd-thumbnail, #inline-preview-player');
+}
+
+function guardPlay(e) {
+  const video = e.target;
+  if (!isExtensionEnabled || !video || video.tagName !== 'VIDEO') return;
+  if (approvedVideos.has(video) || isPreviewVideo(video)) return;
+  const now = Date.now();
+  if (now - lastGestureAt < GESTURE_WINDOW_MS || now - lastEndedAt < NEXT_WINDOW_MS) {
+    approvedVideos.add(video);
+    return;
+  }
+  video.pause();
+  console.log('[YouTube Autoplay Blocker] Автозапуск при загрузке страницы заблокирован');
+}
+
+// События медиа не всплывают — ловим на фазе перехвата
+document.addEventListener('play', guardPlay, true);
+document.addEventListener('playing', guardPlay, true);
+document.addEventListener('loadstart', (e) => {
+  if (e.target && e.target.tagName === 'VIDEO') approvedVideos.delete(e.target);
+}, true);
+document.addEventListener('ended', (e) => {
+  if (e.target && e.target.tagName === 'VIDEO') lastEndedAt = Date.now();
+}, true);
+
 // Отслеживаем изменение видимости вкладки
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {

@@ -22,6 +22,7 @@ This extension automatically blocks video playback when switching to a YouTube t
 ## Features
 
 - ✅ Blocks autoplay when switching to tab
+- ✅ Pauses the player right after the page loads (until you click/press a key; autoplay of the next video after one ends is left alone)
 - ✅ Removes autoplay attribute from video elements
 - ✅ Intercepts programmatic play attempts
 - ✅ On/off toggle
